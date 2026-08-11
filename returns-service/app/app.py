@@ -50,7 +50,7 @@ REASONS = [
     "نقص في الطلب", "سبب آخر",
 ]
 ASSIGNEES = ["في", "مروة", "أميرة"]
-STATUS_LABELS = {"new": "جديد", "will": "سيتم الإرجاع", "doing": "جاري الإرجاع", "done": "تم الإرجاع", "rejected": "مرفوض", "done_salla": "تم الإرجاع في سلة"}
+STATUS_LABELS = {"new": "جديد", "will": "سيتم الإرجاع", "doing": "جاري الإرجاع", "done": "تم الإرجاع", "rejected": "مرفوض", "done_salla": "تم التعميد من المشتريات"}
 
 # --- طريقة الاسترداد (refund method) ---
 # tabby/tamara/madfooat => رقم/مرجع واحد. bank_account => البنك + الحساب + الآيبان.
@@ -304,6 +304,280 @@ async def list_requests(conversation_id: Optional[int] = None, returns_session: 
         return [row_to_dict(r) for r in rows]
 
 
+
+
+@app.get("/returns/api/requests/export")
+async def accountant_export(
+    returns_session: Optional[str] = Cookie(None),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    ids: Optional[str] = None,
+    scope: Optional[str] = None,
+    issue: Optional[str] = None,
+):
+    """Accountant Excel export — login required.
+
+    Unlike the team export this DOES carry the banking detail (bank, account,
+    IBAN, refund reference), because the accountant already sees it on screen and
+    needs it to execute the transfers. Anyone without a session gets a 401.
+    """
+    user = await current_user(returns_session)
+    if not user:
+        raise HTTPException(401, "login required")
+
+    for label, val in (("date_from", date_from), ("date_to", date_to)):
+        if val and not re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+            raise HTTPException(400, f"{label} يجب أن يكون بصيغة YYYY-MM-DD")
+
+    id_list = None
+    if ids and ids.strip():
+        try:
+            id_list = [int(x) for x in ids.split(",") if x.strip()] or None
+        except ValueError:
+            raise HTTPException(400, "قائمة المعرّفات غير صالحة")
+
+    where, args = [], []
+    if id_list:
+        args.append(id_list)
+        where.append(f"id = ANY(${len(args)}::bigint[])")
+    if date_from:
+        args.append(_parse_ymd(date_from, "date_from"))
+        where.append(f"created_at::date >= ${len(args)}")
+    if date_to:
+        args.append(_parse_ymd(date_to, "date_to"))
+        where.append(f"created_at::date <= ${len(args)}")
+    if status:
+        args.append(status)
+        where.append(f"status = ${len(args)}")
+    if issue == "any":
+        where.append("issue_type IS NOT NULL")
+    elif issue in ("complaint", "case"):
+        args.append(issue)
+        where.append(f"issue_type = ${len(args)}")
+    if q and q.strip():
+        args.append(f"%{q.strip()}%")
+        where.append(
+            f"(coalesce(customer_name,'') ILIKE ${len(args)} "
+            f"OR coalesce(order_number,'') ILIKE ${len(args)} "
+            f"OR coalesce(conversation_id::text,'') ILIKE ${len(args)})"
+        )
+
+    sql = "SELECT * FROM return_requests"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY (issue_type IS NOT NULL) DESC, id DESC"
+
+    p = await pool()
+    async with p.acquire() as c:
+        rows = await c.fetch(sql, *args)
+
+    parts = []
+    if date_from or date_to:
+        parts.append(f"الفترة: {date_from or 'البداية'} → {date_to or 'اليوم'}")
+    else:
+        parts.append("الفترة: كل الطلبات")
+    if status:
+        parts.append(f"الحالة: {STATUS_LABELS.get(status, status)}")
+    if issue:
+        parts.append("شكاوى وقضايا فقط")
+    if q and q.strip():
+        parts.append(f"بحث: {q.strip()}")
+    if scope and scope.strip():
+        parts.append(f"العرض: {scope.strip()}")
+
+    buf = _build_accountant_workbook(rows, "  |  ".join(parts),
+                                     (user.get("email") or "").lower())
+    fname = f"returns_accountant_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={fname}",
+            "X-Total-Count": str(len(rows)),
+        },
+    )
+
+
+def _build_accountant_workbook(rows, period_label: str, exported_by: str):
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    def fill(color):
+        return PatternFill("solid", fgColor=color)
+
+    border = Border(*[Side(style="thin", color="D8DEE4")] * 4)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "طلبات الإرجاع"
+    ws.sheet_view.rightToLeft = True
+
+    cols = [
+        ("#", 7), ("رقم المحادثة", 13), ("العميل", 22), ("رقم الطلب", 15),
+        ("مبلغ الطلب", 13), ("سبب الإرجاع", 26), ("الحالة", 20),
+        ("شكوى / قضية", 13), ("تفاصيل الشكوى", 26), ("عُلّمت بواسطة", 13),
+        ("طريقة الاسترداد", 15), ("مرجع الاسترداد", 18),
+        ("البنك", 18), ("رقم الحساب", 22), ("الآيبان", 28),
+        ("ملاحظة المحاسب", 28), ("سبب الرفض", 24), ("الموظف", 12),
+        ("إيصال التحويل", 12), ("تاريخ الإنشاء", 13),
+        ("تاريخ طلب الإرجاع", 15), ("تاريخ الطلب الأصلي", 15), ("آخر تحديث", 16),
+    ]
+    ncols = len(cols)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    c = ws.cell(1, 1, "تقرير طلبات الإرجاع — المحاسب — QAYDAO")
+    c.font = Font(bold=True, size=15, color="FFFFFF")
+    c.fill = fill("1F5F5B")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+    c = ws.cell(2, 1, f"{period_label}   |   بواسطة: {exported_by}   |   "
+                      f"تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    c.font = Font(size=10, color="D6E4E3")
+    c.fill = fill("12403D")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 20
+
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncols)
+    c = ws.cell(3, 1, "\u26A0 يحتوي بيانات بنكية (الآيبان ورقم الحساب) — للاستخدام الداخلي فقط، لا يُشارك خارج قسم المحاسبة.")
+    c.font = Font(bold=True, size=10, color="B3261E")
+    c.fill = fill("FDECEA")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[3].height = 20
+
+    HROW = 4
+    for ci, (title, width) in enumerate(cols, 1):
+        cell = ws.cell(HROW, ci, title)
+        cell.font = Font(bold=True, color="FFFFFF", size=10)
+        cell.fill = fill("2F4858")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(ci)].width = width
+    ws.row_dimensions[HROW].height = 28
+
+    wrap_cols = {6, 9, 16, 17}
+    by_status, by_issue = {}, {}
+    rr = HROW + 1
+    for idx, r in enumerate(rows):
+        flagged = bool(r["issue_type"])
+        st = STATUS_LABELS.get(r["status"], r["status"] or "—")
+        by_status[st] = by_status.get(st, 0) + 1
+        ik = ISSUE_LABELS.get(r["issue_type"], "بدون تعليم") if flagged else "بدون تعليم"
+        by_issue[ik] = by_issue.get(ik, 0) + 1
+
+        values = [
+            r["id"],
+            r["conversation_id"] if r["conversation_id"] is not None else "—",
+            (r["customer_name"] or "—").strip(),
+            (r["order_number"] or "—").strip(),
+            (r["order_amount"] or "—").strip() if r["order_amount"] else "—",
+            (r["reason"] or "—").strip(),
+            st,
+            ISSUE_LABELS.get(r["issue_type"], "—") if flagged else "—",
+            (r["issue_note"] or "—").strip(),
+            (r["issue_marked_by"] or "—").strip(),
+            REFUND_LABELS.get(r["refund_method"] or "bank_account", r["refund_method"] or "—"),
+            (r["refund_reference"] or "—").strip(),
+            (r["bank_name"] or "—").strip(),
+            (r["bank_account"] or "—").strip(),
+            (r["iban"] or "—").strip(),
+            (r["accountant_note"] or "—").strip(),
+            (r["reject_reason"] or "—").strip(),
+            (r["assignee"] or "—").strip() or "—",
+            "نعم" if r["receipt_name"] else "لا",
+            _fmt_dt(r["created_at"]),
+            _fmt_dt(r["return_created_at"]),
+            _fmt_dt(r["original_order_at"]),
+            _fmt_dt(r["updated_at"], True),
+        ]
+        if flagged:
+            row_fill = fill("FBD5D2")
+        elif r["status"] == "rejected":
+            row_fill = fill("FDEDED")
+        else:
+            row_fill = fill("F4F6F8") if idx % 2 else None
+
+        for ci, val in enumerate(values, 1):
+            cell = ws.cell(rr, ci, val)
+            cell.border = border
+            if row_fill:
+                cell.fill = row_fill
+            if ci in wrap_cols:
+                cell.alignment = Alignment(horizontal="right", wrap_text=True, vertical="top")
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            if ci in (14, 15):
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.number_format = "@"
+            if ci == 8 and flagged:
+                cell.font = Font(bold=True, color="B3261E")
+        rr += 1
+
+    tcell = ws.cell(rr, 1, "الإجمالي")
+    tcell.font = Font(bold=True, color="FFFFFF")
+    tcell.fill = fill("1F7A4D")
+    tcell.alignment = Alignment(horizontal="center")
+    for ci in range(2, ncols + 1):
+        cell = ws.cell(rr, ci, f"{len(rows)} طلب" if ci == 2 else "")
+        cell.fill = fill("1F7A4D")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = border
+    ws.row_dimensions[rr].height = 24
+
+    ws.freeze_panes = ws.cell(HROW + 1, 1)
+    if rr - 1 > HROW:
+        ws.auto_filter.ref = f"A{HROW}:{get_column_letter(ncols)}{rr - 1}"
+
+    ws2 = wb.create_sheet("الملخص")
+    ws2.sheet_view.rightToLeft = True
+    ws2.column_dimensions["A"].width = 26
+    ws2.column_dimensions["B"].width = 14
+
+    def block(start_row, title, data):
+        ws2.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=2)
+        h = ws2.cell(start_row, 1, title)
+        h.font = Font(bold=True, size=12, color="FFFFFF")
+        h.fill = fill("1F5F5B")
+        h.alignment = Alignment(horizontal="center")
+        r = start_row + 1
+        for ci, t in enumerate(["البند", "عدد الطلبات"], 1):
+            hc = ws2.cell(r, ci, t)
+            hc.font = Font(bold=True, color="FFFFFF")
+            hc.fill = fill("2F4858")
+            hc.alignment = Alignment(horizontal="center")
+            hc.border = border
+        r += 1
+        for k, v in sorted(data.items(), key=lambda x: -x[1]):
+            ws2.cell(r, 1, k).border = border
+            vc = ws2.cell(r, 2, v)
+            vc.alignment = Alignment(horizontal="center")
+            vc.border = border
+            r += 1
+        tc = ws2.cell(r, 1, "الإجمالي")
+        tc.font = Font(bold=True, color="FFFFFF")
+        tc.fill = fill("1F7A4D")
+        tc.border = border
+        vc = ws2.cell(r, 2, sum(data.values()))
+        vc.font = Font(bold=True, color="FFFFFF")
+        vc.fill = fill("1F7A4D")
+        vc.alignment = Alignment(horizontal="center")
+        vc.border = border
+        return r + 3
+
+    nxt = block(1, "حسب الحالة", by_status)
+    block(nxt, "شكاوى وقضايا", by_issue)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
 @app.get("/returns/api/requests/{rid}")
 async def get_request(rid: int):
     p = await pool()
@@ -388,6 +662,73 @@ async def set_status(rid: int, body: StatusIn, returns_session: Optional[str] = 
         )
     return row_to_dict(out)
 
+
+
+
+ISSUE_LABELS = {"complaint": "شكوى", "case": "قضية"}
+
+
+class IssueIn(BaseModel):
+    issue_type: Optional[str] = None   # 'complaint' | 'case' | None to clear
+    issue_note: Optional[str] = None
+    marked_by: Optional[str] = None
+
+
+@app.post("/returns/api/requests/{rid}/issue")
+async def set_issue(rid: int, body: IssueIn):
+    """Flag a return request as a complaint or a legal case — or clear the flag.
+
+    CS-team action, same trust model as /contacted: reachable from the team page
+    without an accountant login, because whoever receives the complaint is the
+    one who should record it immediately.
+
+    Deliberately does NOT touch `status`: a complaint is orthogonal to where the
+    refund is in its workflow, and overloading status would corrupt the tabs and
+    the accountant's queue. Every change is appended to status_history so the
+    trail survives even if the flag is later cleared.
+    """
+    t = (body.issue_type or "").strip().lower() or None
+    if t is not None and t not in ISSUE_LABELS:
+        raise HTTPException(400, "نوع غير صالح — المسموح: complaint أو case")
+
+    note = (body.issue_note or "").strip() or None
+    who = (body.marked_by or "").strip() or "team"
+
+    p = await pool()
+    async with p.acquire() as c:
+        r = await c.fetchrow("SELECT status_history FROM return_requests WHERE id=$1", rid)
+        if not r:
+            raise HTTPException(404, "not found")
+
+        hist = r["status_history"]
+        if isinstance(hist, str):
+            hist = json.loads(hist)
+        hist = list(hist or [])
+        entry = {
+            "event": "issue",
+            "issue_type": t,
+            "label": ("إزالة التعليم" if t is None else f"تعليم {ISSUE_LABELS[t]}"),
+            "by": who,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        if note:
+            entry["note"] = note
+        hist.append(entry)
+
+        out = await c.fetchrow(
+            # every param carries an explicit cast: $2 appears inside CASE WHEN
+            # branches, and asyncpg/Postgres cannot infer its type there
+            # (AmbiguousParameterError) without one.
+            """UPDATE return_requests
+                  SET issue_type=$2::text,
+                      issue_note      = CASE WHEN $2::text IS NULL THEN NULL ELSE $3::text END,
+                      issue_marked_by = CASE WHEN $2::text IS NULL THEN NULL ELSE $4::text END,
+                      issue_marked_at = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,
+                      status_history=$5::jsonb
+                WHERE id=$1 RETURNING *""",
+            rid, t, note, who, json.dumps(hist),
+        )
+    return row_to_dict(out)
 
 @app.post("/returns/api/requests/{rid}/contacted")
 async def mark_contacted(rid: int):
@@ -702,7 +1043,20 @@ header p{font-size:13px;color:var(--soft);margin-top:2px}
 .tab-old{border-style:dashed;color:#8a92a0}
 .tab-old:hover{border-color:#8a92a0;color:#5a6b7d}
 .tab-old.active{background:#5a6b7d;border-color:#5a6b7d;border-style:solid;color:#fff}
-.refresh{margin-inline-start:auto;background:var(--brand);color:#fff;border:none;border-radius:10px;padding:9px 16px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer}
+.refresh{background:var(--brand);color:#fff;border:none;border-radius:10px;padding:9px 16px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer}
+.dategrp{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--soft)}
+.dategrp input[type=date]{font-family:inherit;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#fff}
+.clearf{background:#fff;color:var(--soft);border:1px solid var(--line);border-radius:10px;padding:9px 13px;font-family:inherit;font-size:12.5px;cursor:pointer}
+.clearf:hover{background:#f4f6f8}
+.xbtn{margin-inline-start:auto;background:#1f7a4d;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap}
+.xbtn:hover{background:#19643f}
+.xbtn:disabled{opacity:.55;cursor:not-allowed}
+/* complaint / legal case — must be impossible to miss before touching the money */
+.card.has-issue{border-color:#b3261e;box-shadow:0 0 0 1px #b3261e,0 6px 20px rgba(179,38,30,.16)}
+.ibanner{padding:9px 13px;font-size:12.5px;font-weight:700;line-height:1.6;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.ibanner.i-complaint{background:#fdecea;color:#b3261e;border-bottom:1px solid #f3c6c1}
+.ibanner.i-case{background:#b3261e;color:#fff}
+.iwho{font-size:11px;font-weight:600;opacity:.85;margin-inline-start:auto}
 .count{font-size:12.5px;color:var(--soft)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:0 1px 2px rgba(31,43,58,.04),0 6px 20px rgba(31,43,58,.05);overflow:hidden}
@@ -789,15 +1143,21 @@ footer{text-align:center;margin-top:26px;font-size:11.5px;color:var(--soft)}
     <button class="tab" data-tab="doing" onclick="setTab('doing',this)">جاري الإرجاع <span class="cnt" id="cnt-doing">0</span></button>
     <button class="tab" data-tab="done" onclick="setTab('done',this)">تم الإرجاع <span class="cnt" id="cnt-done">0</span></button>
     <button class="tab" data-tab="rejected" onclick="setTab('rejected',this)">مرفوض <span class="cnt" id="cnt-rejected">0</span></button>
-    <button class="tab" data-tab="done_salla" id="tab-done_salla" style="display:none" onclick="setTab('done_salla',this)">تم الإرجاع في سلة <span class="cnt" id="cnt-done_salla">0</span></button>
+    <button class="tab" data-tab="done_salla" id="tab-done_salla" style="display:none" onclick="setTab('done_salla',this)">تم التعميد من المشتريات <span class="cnt" id="cnt-done_salla">0</span></button>
     <button class="tab tab-old" data-tab="old_done" onclick="setTab('old_done',this)">قديمة — تم الإرجاع <span class="cnt" id="cnt-old_done">0</span></button>
     <button class="tab tab-old" data-tab="old_rejected" onclick="setTab('old_rejected',this)">قديمة — مرفوضة <span class="cnt" id="cnt-old_rejected">0</span></button>
     <button class="tab" data-tab="all" onclick="setTab('all',this)">الكل <span class="cnt" id="cnt-all">0</span></button>
   </div>
   <div class="tools">
+    <span class="dategrp">
+      من <input type="date" id="fdate_from" onchange="render()">
+      إلى <input type="date" id="fdate_to" onchange="render()">
+    </span>
     <input id="fsearch" placeholder="بحث بالاسم أو رقم الطلب أو المحادثة…" oninput="render()">
+    <button class="clearf" onclick="clearFilters()">مسح الفلاتر</button>
     <span class="count" id="count"></span>
     <button class="refresh" onclick="load()">تحديث ⟳</button>
+    <button class="xbtn" id="xbtn" onclick="exportExcel()" title="تصدير الطلبات الظاهرة حالياً إلى Excel (يشمل البيانات البنكية)">📥 تصدير Excel</button>
   </div>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" style="display:none">لا توجد طلبات في هذا القسم.</div>
@@ -807,7 +1167,7 @@ footer{text-align:center;margin-top:26px;font-size:11.5px;color:var(--soft)}
 <script>
 var API="/returns/api/requests";
 var DATA=[];
-var SL={new:"جديد",will:"سيتم الإرجاع",doing:"جاري الإرجاع",done:"تم الإرجاع",rejected:"مرفوض",done_salla:"تم الإرجاع في سلة"};
+var SL={new:"جديد",will:"سيتم الإرجاع",doing:"جاري الإرجاع",done:"تم الإرجاع",rejected:"مرفوض",done_salla:"تم التعميد من المشتريات"};
 var ME={email:"",allowed_statuses:["will","doing","done","rejected"],is_purchaser:false};
 function canStatus(st){return ME.allowed_statuses&&ME.allowed_statuses.indexOf(st)>=0;}
 function canSalla(){return canStatus("done_salla");}
@@ -851,6 +1211,7 @@ function inTab(x){
     case "done_salla":   return x.status==="done_salla";
     case "old_done":     return x.status==="done"     &&  isOld(x);
     case "old_rejected": return x.status==="rejected" &&  isOld(x);
+    case "issues":       return !!x.issue_type;
     default:             return true;
   }
 }
@@ -871,15 +1232,72 @@ function updateCounts(){
   set("cnt-old_done",c.old_done);set("cnt-old_rejected",c.old_rejected);
   set("cnt-all",DATA.length);
 }
+// Date filter runs on created_at — the field the accountant reconciles against.
+var VISIBLE=[];
+function inDateRange(x,df,dt){
+  var raw=x.created_at||x.return_created_at;
+  if(!raw)return !(df||dt);
+  var d=String(raw).slice(0,10);
+  if(df && d<df)return false;
+  if(dt && d>dt)return false;
+  return true;
+}
+function clearFilters(){
+  document.getElementById("fdate_from").value="";
+  document.getElementById("fdate_to").value="";
+  document.getElementById("fsearch").value="";
+  render();
+}
+function tabLabel(){
+  var b=document.querySelector('#tabs .tab.active');
+  return b?b.textContent.replace(/\s*\d+\s*$/,"").trim():"";
+}
+function exportExcel(){
+  var btn=document.getElementById("xbtn");
+  if(!VISIBLE.length){alert("لا توجد طلبات مطابقة للفلاتر الحالية.");return}
+  btn.disabled=true;var old=btn.textContent;btn.textContent="جارٍ التصدير…";
+  var p=new URLSearchParams();
+  p.set("ids",VISIBLE.map(function(x){return x.id}).join(","));
+  var df=document.getElementById("fdate_from").value;
+  var dt=document.getElementById("fdate_to").value;
+  if(df)p.set("date_from",df);
+  if(dt)p.set("date_to",dt);
+  var qq=document.getElementById("fsearch").value.trim();
+  if(qq)p.set("q",qq);
+  var sc=tabLabel();if(sc)p.set("scope",sc);
+  fetch("/returns/api/requests/export?"+p.toString(),{credentials:"same-origin"})
+    .then(function(r){
+      if(r.status===401){location.href="/accountant-login";throw new Error("انتهت الجلسة")}
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      return r.blob();
+    })
+    .then(function(b){
+      var u=URL.createObjectURL(b),a=document.createElement("a");
+      a.href=u;a.download="returns_accountant_"+new Date().toISOString().slice(0,10)+".xlsx";
+      document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);
+    })
+    .catch(function(e){alert("تعذّر التصدير: "+e.message)})
+    .finally(function(){btn.disabled=false;btn.textContent=old});
+}
 function render(){
   updateCounts();
   var q=document.getElementById("fsearch").value.trim().toLowerCase();
+  var df=document.getElementById("fdate_from").value;
+  var dt=document.getElementById("fdate_to").value;
   var list=DATA.filter(function(x){
     if(!inTab(x))return false;
+    if(!inDateRange(x,df,dt))return false;
     if(q){var h=((x.customer_name||"")+" "+(x.order_number||"")+" "+(x.conversation_id||"")).toLowerCase();if(h.indexOf(q)<0)return false}
     return true;
   });
-  document.getElementById("count").textContent=list.length+" طلب";
+  // flagged first — a complaint or case should never be buried below the fold
+  list.sort(function(a,b){return (b.issue_type?1:0)-(a.issue_type?1:0)});
+  VISIBLE=list;
+  var txt=list.length+" طلب";
+  if(list.length!==DATA.length)txt+=" من أصل "+DATA.length;
+  var fl=list.filter(function(x){return !!x.issue_type}).length;
+  if(fl)txt+=" · "+fl+" شكوى/قضية";
+  document.getElementById("count").textContent=txt;
   var g=document.getElementById("grid"),e=document.getElementById("empty");
   if(!list.length){g.innerHTML="";e.style.display="block";return}
   e.style.display="none";
@@ -936,7 +1354,15 @@ function card(x){
   var isNew=isRecentOrder(x.original_order_at);
   var order=x.order_number?('<a class="olink ltr" href="#" onclick="return orderClick(\''+esc(x.order_number)+'\')">'+esc(x.order_number)+'</a>'):"—";
   var histRows=(x.status_history||[]).map(function(h){return '<div><b>'+esc(h.label)+'</b> · '+esc((h.at||"").replace("T"," ").slice(0,16))+' · '+esc(h.by||"")+'</div>'}).join("");
-  return '<div class="card'+(isNew?' is-new':'')+'">'+
+  var issueBanner = x.issue_type
+    ? ('<div class="ibanner i-'+esc(x.issue_type)+'">'+(x.issue_type==="case"?"\u2696":"\u26A0")+' '
+       + esc(x.issue_type==="case"?"قضية":"شكوى")
+       + (x.issue_note?(' — '+esc(x.issue_note)):'')
+       + (x.issue_marked_by?('<span class="iwho">علّمها: '+esc(x.issue_marked_by)+'</span>'):'')
+       + '</div>')
+    : '';
+  return '<div class="card'+(isNew?' is-new':'')+(x.issue_type?' has-issue':'')+'">'+
+    issueBanner+
     (isNew?'<div class="ribbon-new">طلب منتج جديد</div>':'')+
     '<div class="chead"><span class="nm">'+esc(x.customer_name||"—")+'</span><span class="st '+x.status+'">'+esc(SL[x.status]||x.status)+'</span></div>'+
     '<div class="cbody">'+
@@ -960,7 +1386,7 @@ function card(x){
         : (function(){
             var acts=visibleActions(x);
             if(!acts.length) return '';
-            var LBL={will:"سيتم الإرجاع",doing:"جاري الإرجاع",done:"تم الإرجاع",rejected:"مرفوض",done_salla:"تم الإرجاع في سلة"};
+            var LBL={will:"سيتم الإرجاع",doing:"جاري الإرجاع",done:"تم الإرجاع",rejected:"مرفوض",done_salla:"تم التعميد من المشتريات"};
             var btns=acts.map(function(st){
               return '<button class="sbtn '+st+'" data-st="'+st+'" onclick="pick('+x.id+',\''+st+'\',this)">'+LBL[st]+'</button>';
             }).join("");
@@ -1078,7 +1504,7 @@ function submitStatus(id,btn){
 }
 function initMe(cb){fetch("/returns/api/me",{credentials:"same-origin"}).then(function(r){if(r.status===401){location.href="/accountant-login";return null}return r.json()}).then(function(m){if(m){ME=m;applyRole();}if(cb)cb();}).catch(function(){if(cb)cb();});}
 function applyRole(){
-  // The "تم الإرجاع في سلة" tab is a follow-up view for EVERYONE:
+  // The "تم التعميد من المشتريات" tab is a follow-up view for EVERYONE:
   //  - النذير sees it to track what he confirmed;
   //  - the financial accountant sees it to pick up done_salla requests for the
   //    financial transfer step.
@@ -1116,7 +1542,8 @@ setInterval(load,20000);
 _TEAM_COLUMNS = """id, conversation_id, customer_name, order_number, reason,
                    status, accountant_note, reject_reason, assignee,
                    receipt_name, status_history, return_created_at, created_at,
-                   updated_at, contacted_at, refund_method"""
+                   updated_at, contacted_at, refund_method,
+                   issue_type, issue_note, issue_marked_by, issue_marked_at"""
 
 
 def _parse_ymd(value, label):
@@ -1130,7 +1557,7 @@ def _parse_ymd(value, label):
 
 
 async def _fetch_team_rows(date_from=None, date_to=None, status=None,
-                           assignee=None, q=None, ids=None):
+                           assignee=None, q=None, ids=None, issue=None):
     """Filtered rows, newest first. No LIMIT — a silent cap would hide records
     from the exported sheet exactly the way it would hide them from the screen.
 
@@ -1158,6 +1585,11 @@ async def _fetch_team_rows(date_from=None, date_to=None, status=None,
     if assignee:
         args.append(assignee.strip())
         where.append(f"btrim(coalesce(assignee,'')) = ${len(args)}")
+    if issue == "any":
+        where.append("issue_type IS NOT NULL")
+    elif issue in ("complaint", "case"):
+        args.append(issue)
+        where.append(f"issue_type = ${len(args)}")
     if q and q.strip():
         args.append(f"%{q.strip()}%")
         where.append(
@@ -1184,8 +1616,9 @@ async def team_requests(
     status: Optional[str] = None,
     assignee: Optional[str] = None,
     q: Optional[str] = None,
+    issue: Optional[str] = None,
 ):
-    rows = await _fetch_team_rows(date_from, date_to, status, assignee, q)
+    rows = await _fetch_team_rows(date_from, date_to, status, assignee, q, None, issue)
     response.headers["X-Total-Count"] = str(len(rows))
     response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
     out = []
@@ -1194,7 +1627,7 @@ async def team_requests(
         for k in ("return_created_at",):
             if d.get(k) is not None:
                 d[k] = d[k].isoformat()
-        for k in ("created_at", "updated_at", "contacted_at"):
+        for k in ("created_at", "updated_at", "contacted_at", "issue_marked_at"):
             if d.get(k) is not None:
                 d[k] = d[k].isoformat()
         if isinstance(d.get("status_history"), str):
@@ -1206,6 +1639,7 @@ async def team_requests(
         # طريقة الاسترداد فقط — الرقم/المرجع والبيانات البنكية تبقى مستبعدة هنا (خصوصية).
         d["refund_method_label"] = REFUND_LABELS.get(d.get("refund_method") or "bank_account",
                                                     d.get("refund_method"))
+        d["issue_label"] = ISSUE_LABELS.get(d.get("issue_type")) if d.get("issue_type") else None
         out.append(d)
     return out
 
@@ -1222,6 +1656,7 @@ _XL_FILL_HEADER = "2F4858"
 _XL_FILL_TOTAL = "1F7A4D"
 _XL_FILL_STRIPE = "F4F6F8"
 _XL_FILL_REJECTED = "FDEDED"
+_XL_FILL_ISSUE = "FBD5D2"
 
 
 def _fmt_dt(v, with_time=False):
@@ -1254,6 +1689,7 @@ def _build_returns_workbook(rows, period_label: str):
     cols = [
         ("#", 7), ("رقم المحادثة", 13), ("العميل", 22), ("رقم الطلب", 15),
         ("سبب الإرجاع", 26), ("طريقة الاسترداد", 16), ("الحالة", 16),
+        ("شكوى / قضية", 13), ("تفاصيل الشكوى", 28), ("عُلّمت بواسطة", 14),
         ("ملاحظة المحاسب", 30), ("سبب الرفض", 26), ("الموظف", 12),
         ("إيصال التحويل", 12), ("تم التواصل", 14),
         ("تاريخ الإنشاء", 14), ("تاريخ إنشاء الإرجاع", 16), ("آخر تحديث", 16),
@@ -1274,7 +1710,7 @@ def _build_returns_workbook(rows, period_label: str):
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[2].height = 20
 
-    by_status, by_assignee, by_month = {}, {}, {}
+    by_status, by_assignee, by_month, by_issue = {}, {}, {}, {}
     for r in rows:
         st = STATUS_LABELS.get(r["status"], r["status"] or "—")
         by_status[st] = by_status.get(st, 0) + 1
@@ -1282,6 +1718,8 @@ def _build_returns_workbook(rows, period_label: str):
         by_assignee[ag] = by_assignee.get(ag, 0) + 1
         m = r["created_at"].strftime("%Y-%m") if r["created_at"] else "—"
         by_month[m] = by_month.get(m, 0) + 1
+        ik = ISSUE_LABELS.get(r["issue_type"], "بدون تعليم") if r["issue_type"] else "بدون تعليم"
+        by_issue[ik] = by_issue.get(ik, 0) + 1
 
     kpis = [("إجمالي الطلبات", len(rows))] + [(k, v) for k, v in sorted(by_status.items(), key=lambda x: -x[1])][:4]
     span = max(1, ncols // max(1, len(kpis)))
@@ -1312,10 +1750,11 @@ def _build_returns_workbook(rows, period_label: str):
         ws.column_dimensions[get_column_letter(ci)].width = width
     ws.row_dimensions[HROW].height = 28
 
-    wrap_cols = {5, 8, 9}
+    wrap_cols = {5, 9, 11, 12}
     rr = HROW + 1
     for idx, r in enumerate(rows):
         is_rejected = r["status"] == "rejected"
+        is_flagged = bool(r["issue_type"])
         values = [
             r["id"],
             r["conversation_id"] if r["conversation_id"] is not None else "—",
@@ -1324,6 +1763,9 @@ def _build_returns_workbook(rows, period_label: str):
             (r["reason"] or "—").strip(),
             REFUND_LABELS.get(r["refund_method"] or "bank_account", r["refund_method"] or "—"),
             STATUS_LABELS.get(r["status"], r["status"] or "—"),
+            ISSUE_LABELS.get(r["issue_type"], "—") if r["issue_type"] else "—",
+            (r["issue_note"] or "—").strip(),
+            (r["issue_marked_by"] or "—").strip(),
             (r["accountant_note"] or "—").strip(),
             (r["reject_reason"] or "—").strip(),
             (r["assignee"] or "—").strip() or "—",
@@ -1333,7 +1775,13 @@ def _build_returns_workbook(rows, period_label: str):
             _fmt_dt(r["return_created_at"]),
             _fmt_dt(r["updated_at"], True),
         ]
-        row_fill = fill(_XL_FILL_REJECTED) if is_rejected else (fill(_XL_FILL_STRIPE) if idx % 2 else None)
+        # complaints / cases outrank a plain rejection visually — they need chasing.
+        if is_flagged:
+            row_fill = fill(_XL_FILL_ISSUE)
+        elif is_rejected:
+            row_fill = fill(_XL_FILL_REJECTED)
+        else:
+            row_fill = fill(_XL_FILL_STRIPE) if idx % 2 else None
         for ci, val in enumerate(values, 1):
             cell = ws.cell(rr, ci, val)
             cell.border = border
@@ -1345,6 +1793,8 @@ def _build_returns_workbook(rows, period_label: str):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             if ci == 7 and is_rejected:
                 cell.font = Font(bold=True, color="C0392B")
+            if ci == 8 and is_flagged:
+                cell.font = Font(bold=True, color="B3261E")
         rr += 1
 
     tcell = ws.cell(rr, 1, "الإجمالي")
@@ -1361,7 +1811,8 @@ def _build_returns_workbook(rows, period_label: str):
 
     note = ws.cell(rr + 2, 1,
                    "ملاحظة: البيانات البنكية (الآيبان ورقم الحساب ومرجع الاسترداد) مستبعدة عمداً من هذا التقرير — "
-                   "تظهر في صفحة المحاسب فقط. الصفوف المرفوضة بخلفية حمراء.")
+                   "تظهر في صفحة المحاسب فقط. الصفوف المرفوضة بخلفية حمراء فاتحة، "
+                   "والمعلَّمة كشكوى أو قضية بخلفية حمراء أغمق.")
     note.font = Font(size=9, color="5A6B7D")
     ws.merge_cells(start_row=rr + 2, start_column=1, end_row=rr + 2, end_column=ncols)
 
@@ -1406,6 +1857,7 @@ def _build_returns_workbook(rows, period_label: str):
         return r + 3
 
     nxt = block(1, "حسب الحالة", by_status)
+    nxt = block(nxt, "شكاوى وقضايا", by_issue)
     nxt = block(nxt, "حسب الموظف", by_assignee)
     block(nxt, "حسب الشهر", by_month)
 
@@ -1424,6 +1876,7 @@ async def team_requests_export(
     q: Optional[str] = None,
     ids: Optional[str] = None,
     scope: Optional[str] = None,
+    issue: Optional[str] = None,
 ):
     """Excel of every row matching the filters — deliberately uncapped."""
     for label, val in (("date_from", date_from), ("date_to", date_to)):
@@ -1441,7 +1894,7 @@ async def team_requests_export(
         if not id_list:
             id_list = None
 
-    rows = await _fetch_team_rows(date_from, date_to, status, assignee, q, id_list)
+    rows = await _fetch_team_rows(date_from, date_to, status, assignee, q, id_list, issue)
 
     parts = []
     if date_from or date_to:
@@ -1541,6 +1994,34 @@ tr.rejrow{background:var(--rejsoft)}
 .b-done_salla{background:#eef4ff;color:#3b5bdb}
 .b-rejected_contacted{background:#eef1f4;color:#5a6b7d;border:1px solid #d7dde4}
 tr.contactedrow{background:#fbfcfd}
+tr.issuerow{background:#fdf0ef;box-shadow:inset 3px 0 0 0 #b3261e}
+tr.issuerow td{border-color:#f3c6c1}
+.ibadge{display:inline-block;font-size:11px;font-weight:800;border-radius:8px;padding:3px 9px;white-space:nowrap}
+.i-complaint{background:#fdecea;color:#b3261e;border:1px solid #f3c6c1}
+.i-case{background:#b3261e;color:#fff}
+.inote{font-size:11px;color:var(--soft);margin-top:3px;max-width:190px}
+.iby{font-size:10px;color:#98a6b4;margin-top:2px}
+.flag-btn{font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border-radius:8px;padding:4px 10px;background:#fff;color:var(--soft);border:1px dashed #c9d2da;white-space:nowrap;transition:.15s}
+.flag-btn:hover{background:#fdecea;color:#b3261e;border-color:#f3c6c1;border-style:solid}
+.flag-btn.edit{margin-top:4px;padding:2px 8px;font-size:10px}
+.tab-issue{color:#b3261e}
+.tab-issue.active{background:#b3261e;color:#fff;border-color:#b3261e}
+.issuecell{min-width:130px}
+.modal-bg{position:fixed;inset:0;background:rgba(20,28,38,.45);display:none;align-items:center;justify-content:center;z-index:60}
+.modal-bg.show{display:flex}
+.modal{background:#fff;border-radius:16px;padding:22px;width:min(430px,92vw);box-shadow:0 18px 50px rgba(0,0,0,.2)}
+.modal h3{margin:0 0 4px;font-size:16px;color:var(--ink)}
+.modal p.sub{margin:0 0 14px;font-size:12px;color:var(--soft)}
+.opt{display:flex;gap:9px;margin-bottom:12px;flex-wrap:wrap}
+.opt button{flex:1;min-width:110px;font-family:inherit;font-size:13px;font-weight:700;padding:11px 8px;border-radius:11px;border:1.5px solid var(--line);background:#fff;color:var(--ink);cursor:pointer;transition:.15s}
+.opt button.sel{border-color:#b3261e;background:#fdecea;color:#b3261e}
+.opt button.none.sel{border-color:var(--soft);background:#eef1f4;color:var(--ink)}
+.modal textarea{width:100%;font-family:inherit;font-size:13px;padding:10px 12px;border:1px solid var(--line);border-radius:11px;resize:vertical;min-height:70px;box-sizing:border-box}
+.modal .acts{display:flex;gap:9px;margin-top:15px}
+.modal .acts button{flex:1;font-family:inherit;font-weight:700;font-size:13.5px;padding:10px;border-radius:11px;cursor:pointer;border:none}
+.btn-save{background:var(--brand);color:#fff}
+.btn-cancel{background:#eef1f4;color:var(--soft)}
+.btn-save:disabled{opacity:.6;cursor:not-allowed}
 .contact-btn{font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border-radius:8px;padding:4px 10px;background:#fff;color:var(--rej);border:1px solid #f3c6c1;transition:.15s;white-space:nowrap}
 .contact-btn:hover{background:var(--rejsoft)}
 .contact-done{font-size:10.5px;font-weight:700;color:var(--soft);white-space:nowrap}
@@ -1569,6 +2050,7 @@ footer{text-align:center;margin-top:22px;font-size:11.5px;color:var(--soft)}
     <button class="tab" data-tab="rejected" onclick="setTab('rejected',this)">مرفوض <span class="cnt" id="tcnt-rejected">0</span></button>
     <button class="tab tab-old" data-tab="old_done" onclick="setTab('old_done',this)">قديمة — تم الإرجاع <span class="cnt" id="tcnt-old_done">0</span></button>
     <button class="tab tab-old" data-tab="old_rejected" onclick="setTab('old_rejected',this)">قديمة — مرفوضة <span class="cnt" id="tcnt-old_rejected">0</span></button>
+    <button class="tab tab-issue" data-tab="issues" onclick="setTab('issues',this)">&#9873; شكاوى وقضايا <span class="cnt" id="tcnt-issues">0</span></button>
   </div>
   <div class="tools">
     <span class="dategrp">
@@ -1585,7 +2067,7 @@ footer{text-align:center;margin-top:22px;font-size:11.5px;color:var(--soft)}
     <table>
       <thead><tr>
         <th>رقم المحادثة</th><th>العميل</th><th>رقم الطلب</th><th>سبب الإرجاع</th>
-        <th>طريقة الاسترداد</th><th>الحالة</th><th>ملاحظة المحاسب</th><th>سبب الرفض</th><th>إيصال التحويل</th><th>الموظف</th><th>إجراء</th>
+        <th>طريقة الاسترداد</th><th>الحالة</th><th>شكوى / قضية</th><th>ملاحظة المحاسب</th><th>سبب الرفض</th><th>إيصال التحويل</th><th>الموظف</th><th>إجراء</th>
       </tr></thead>
       <tbody id="tbody"></tbody>
     </table>
@@ -1610,7 +2092,7 @@ var EMAIL="financial@qaydao.com";
   }
 })();
 var DATA=[];
-var SL={new:"جديد",will:"سيتم الإرجاع",doing:"جاري الإرجاع",done:"تم الإرجاع",rejected:"مرفوض",done_salla:"تم الإرجاع في سلة"};
+var SL={new:"جديد",will:"سيتم الإرجاع",doing:"جاري الإرجاع",done:"تم الإرجاع",rejected:"مرفوض",done_salla:"تم التعميد من المشتريات"};
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
 function load(){fetch(API).then(function(r){return r.json()}).then(function(d){DATA=Array.isArray(d)?d:[];render()}).catch(function(){})}
 var CURAGENT="";  // "" = الكل
@@ -1650,9 +2132,10 @@ function setTab(t,btn){
   render();
 }
 function updateTabCounts(scope){
-  var c={all:scope.length,new:0,will:0,doing:0,done:0,rejected:0,old_done:0,old_rejected:0};
+  var c={all:scope.length,new:0,will:0,doing:0,done:0,rejected:0,old_done:0,old_rejected:0,issues:0};
   scope.forEach(function(x){
     var o=isOld(x);
+    if(x.issue_type)c.issues++;
     if(x.status==="new")c.new++;
     else if(x.status==="will")c.will++;
     else if(x.status==="doing")c.doing++;
@@ -1730,6 +2213,7 @@ function exportExcel(){
   if(qq)p.set("q",qq);
   if(CURAGENT)p.set("assignee",CURAGENT);
   var sc=tabLabel();if(sc)p.set("scope",sc);
+  if(CURTAB==="issues")p.set("issue","any");
   fetch(API+"/export?"+p.toString())
     .then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.blob()})
     .then(function(b){
@@ -1792,13 +2276,21 @@ function row(x){
   }else if(contacted){
     action='<span class="contact-done">\u2713 تمت المتابعة</span>';
   }
-  return '<tr class="'+(openRej?"rejrow":(contacted?"contactedrow":""))+'">'+
+  var issueCell = x.issue_type
+    ? ('<span class="ibadge i-'+esc(x.issue_type)+'">'+(x.issue_type==="case"?"\u2696":"\u26A0")+' '+esc(x.issue_label||"")+'</span>'
+       + (x.issue_note?('<div class="inote">'+esc(x.issue_note)+'</div>'):'')
+       + '<div class="iby">'+esc(x.issue_marked_by||"")+'</div>'
+       + '<button class="flag-btn edit" onclick="openIssue('+x.id+')">تعديل</button>')
+    : '<button class="flag-btn" onclick="openIssue('+x.id+')">\u2691 تعليم</button>';
+  var rowCls = x.issue_type ? "issuerow" : (openRej?"rejrow":(contacted?"contactedrow":""));
+  return '<tr class="'+rowCls+'">'+
     '<td class="ltr">'+esc(x.conversation_id||"—")+'</td>'+
     '<td>'+esc(x.customer_name||"—")+'</td>'+
     '<td class="ltr">'+esc(x.order_number||"—")+'</td>'+
     '<td>'+esc(x.reason||"—")+'</td>'+
     '<td>'+esc(x.refund_method_label||"—")+'</td>'+
     '<td>'+badge+'</td>'+
+    '<td class="issuecell">'+issueCell+'</td>'+
     '<td class="note">'+esc(x.accountant_note||"—")+'</td>'+
     '<td class="'+(openRej?"rej":"")+'">'+rejCell+'</td>'+
     '<td>'+(x.receipt_name?('<a class="rcpt-dl" href="/returns/api/requests/'+x.id+'/receipt" target="_blank">\u2B07 تحميل الإيصال</a>'):'—')+'</td>'+
@@ -1806,6 +2298,51 @@ function row(x){
     '<td>'+action+'</td>'+
   '</tr>';
 }
+
+// ── Complaint / legal-case flag ───────────────────────────────────────────────
+// Open to everyone on the team page, by design: whoever takes the complaint
+// records it immediately. Kept separate from `status` so the workflow tabs and
+// the accountant queue stay intact.
+var IRID=null, IPICK=undefined;
+function openIssue(id){
+  IRID=id;
+  var x=null;
+  for(var i=0;i<DATA.length;i++){if(DATA[i].id===id){x=DATA[i];break}}
+  IPICK = x && x.issue_type ? x.issue_type : undefined;
+  document.getElementById("inote").value = (x && x.issue_note) ? x.issue_note : "";
+  document.getElementById("isub").textContent =
+    "الطلب #"+id+(x&&x.customer_name?(" — "+x.customer_name):"");
+  paintPick();
+  document.getElementById("imodal").classList.add("show");
+}
+function closeIssue(){document.getElementById("imodal").classList.remove("show");IRID=null;IPICK=undefined}
+function pickIssue(t){IPICK=t;paintPick()}
+function paintPick(){
+  ["complaint","case","none"].forEach(function(k){
+    var b=document.getElementById("opt-"+k);
+    if(!b)return;
+    var on = (k==="none") ? (IPICK===null) : (IPICK===k);
+    b.classList.toggle("sel", on);
+  });
+}
+function saveIssue(){
+  if(IRID===null)return;
+  if(IPICK===undefined){alert("اختر: شكوى أو قضية أو إزالة التعليم.");return}
+  var btn=document.getElementById("isave");
+  btn.disabled=true;var old=btn.textContent;btn.textContent="جارٍ الحفظ…";
+  fetch("/returns/api/requests/"+IRID+"/issue",{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({issue_type:IPICK,issue_note:document.getElementById("inote").value,marked_by:whoAmI()})
+  }).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()})
+    .then(function(){closeIssue();load()})
+    .catch(function(e){alert("تعذّر الحفظ: "+e.message)})
+    .finally(function(){btn.disabled=false;btn.textContent=old});
+}
+function whoAmI(){
+  // the team page has no login; the agent filter in the URL is the best signal
+  return CURAGENT || "الفريق";
+}
+
 function markContacted(id,btn){
   btn.disabled=true;btn.textContent="جارٍ…";
   fetch(API.replace("/team-requests","")+"/requests/"+id+"/contacted",{method:"POST"})
