@@ -21,7 +21,7 @@ import secrets
 import asyncpg
 import bcrypt
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Cookie
 from fastapi.responses import JSONResponse, HTMLResponse, Response, FileResponse, RedirectResponse
 from pydantic import BaseModel
@@ -1106,27 +1106,97 @@ setInterval(load,20000);
 # ------------------- Team "submitted requests" page -------------------
 # Option B: NO bank account / IBAN columns (reduce spread of banking data).
 
-@app.get("/returns/api/team-requests")
-async def team_requests():
+# ── Team requests: shared filtering for list + export ──────────────────────────
+# The list endpoint and the Excel export MUST read through this one function, so
+# "what you see" and "what you export" can never drift apart.
+#
+# PRIVACY: iban / bank_account / refund_reference are deliberately NOT selected
+# here. The team page only ever shows the refund METHOD; the full banking detail
+# stays on the accountant page. The export inherits that boundary.
+_TEAM_COLUMNS = """id, conversation_id, customer_name, order_number, reason,
+                   status, accountant_note, reject_reason, assignee,
+                   receipt_name, status_history, return_created_at, created_at,
+                   updated_at, contacted_at, refund_method"""
+
+
+def _parse_ymd(value, label):
+    """'YYYY-MM-DD' -> datetime.date, or a 400 the caller can show the user."""
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{label} يجب أن يكون بصيغة YYYY-MM-DD")
+
+
+async def _fetch_team_rows(date_from=None, date_to=None, status=None,
+                           assignee=None, q=None, ids=None):
+    """Filtered rows, newest first. No LIMIT — a silent cap would hide records
+    from the exported sheet exactly the way it would hide them from the screen.
+
+    `ids` wins over the other filters: the page sends the exact rows it is
+    displaying, so "what you see" and "what you export" stay identical even for
+    the قديمة tabs, whose age rule is computed in the browser from status_history.
+    """
+    where, args = [], []
+
+    if ids:
+        args.append(list(ids))
+        where.append(f"id = ANY(${len(args)}::bigint[])")
+
+    # asyncpg binds by Python type — a 'YYYY-MM-DD' string is rejected even with a
+    # ::date cast in the SQL, so parse to a real date object before binding.
+    if date_from:
+        args.append(_parse_ymd(date_from, "date_from"))
+        where.append(f"created_at::date >= ${len(args)}")
+    if date_to:
+        args.append(_parse_ymd(date_to, "date_to"))
+        where.append(f"created_at::date <= ${len(args)}")
+    if status:
+        args.append(status)
+        where.append(f"status = ${len(args)}")
+    if assignee:
+        args.append(assignee.strip())
+        where.append(f"btrim(coalesce(assignee,'')) = ${len(args)}")
+    if q and q.strip():
+        args.append(f"%{q.strip()}%")
+        where.append(
+            f"(coalesce(customer_name,'') ILIKE ${len(args)} "
+            f"OR coalesce(order_number,'') ILIKE ${len(args)} "
+            f"OR coalesce(conversation_id::text,'') ILIKE ${len(args)})"
+        )
+
+    sql = f"SELECT {_TEAM_COLUMNS} FROM return_requests"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC"
+
     p = await pool()
     async with p.acquire() as c:
-        rows = await c.fetch(
-            """SELECT id, conversation_id, customer_name, order_number, reason,
-                      status, accountant_note, reject_reason, assignee,
-                      receipt_name, status_history, return_created_at, updated_at,
-                      contacted_at, refund_method
-                 FROM return_requests ORDER BY id DESC LIMIT 300"""
-        )
+        return await c.fetch(sql, *args)
+
+
+@app.get("/returns/api/team-requests")
+async def team_requests(
+    response: Response,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    assignee: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    rows = await _fetch_team_rows(date_from, date_to, status, assignee, q)
+    response.headers["X-Total-Count"] = str(len(rows))
+    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
     out = []
     for r in rows:
         d = dict(r)
         for k in ("return_created_at",):
             if d.get(k) is not None:
                 d[k] = d[k].isoformat()
-        if d.get("updated_at") is not None:
-            d["updated_at"] = d["updated_at"].isoformat()
-        if d.get("contacted_at") is not None:
-            d["contacted_at"] = d["contacted_at"].isoformat()
+        for k in ("created_at", "updated_at", "contacted_at"):
+            if d.get(k) is not None:
+                d[k] = d[k].isoformat()
         if isinstance(d.get("status_history"), str):
             try:
                 d["status_history"] = json.loads(d["status_history"])
@@ -1139,6 +1209,265 @@ async def team_requests():
         out.append(d)
     return out
 
+
+
+
+# ── Excel export (team view) ───────────────────────────────────────────────────
+# Same filters as the list endpoint, no row cap. Banking detail stays excluded:
+# the sheet carries the refund METHOD only, matching what the team page shows.
+
+_XL_FILL_TITLE = "1F5F5B"
+_XL_FILL_META = "12403D"
+_XL_FILL_HEADER = "2F4858"
+_XL_FILL_TOTAL = "1F7A4D"
+_XL_FILL_STRIPE = "F4F6F8"
+_XL_FILL_REJECTED = "FDEDED"
+
+
+def _fmt_dt(v, with_time=False):
+    if not v:
+        return "—"
+    try:
+        if with_time:
+            return v.strftime("%Y-%m-%d %H:%M")
+        return v.strftime("%Y-%m-%d")
+    except Exception:
+        return str(v)
+
+
+def _build_returns_workbook(rows, period_label: str):
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    def fill(color):
+        return PatternFill("solid", fgColor=color)
+
+    border = Border(*[Side(style="thin", color="D8DEE4")] * 4)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "طلبات الإرجاع"
+    ws.sheet_view.rightToLeft = True
+
+    cols = [
+        ("#", 7), ("رقم المحادثة", 13), ("العميل", 22), ("رقم الطلب", 15),
+        ("سبب الإرجاع", 26), ("طريقة الاسترداد", 16), ("الحالة", 16),
+        ("ملاحظة المحاسب", 30), ("سبب الرفض", 26), ("الموظف", 12),
+        ("إيصال التحويل", 12), ("تم التواصل", 14),
+        ("تاريخ الإنشاء", 14), ("تاريخ إنشاء الإرجاع", 16), ("آخر تحديث", 16),
+    ]
+    ncols = len(cols)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    c = ws.cell(1, 1, "تقرير طلبات الإرجاع — QAYDAO")
+    c.font = Font(bold=True, size=15, color="FFFFFF")
+    c.fill = fill(_XL_FILL_TITLE)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+    c = ws.cell(2, 1, f"{period_label}   |   تاريخ التصدير: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    c.font = Font(size=10, color="D6E4E3")
+    c.fill = fill(_XL_FILL_META)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 20
+
+    by_status, by_assignee, by_month = {}, {}, {}
+    for r in rows:
+        st = STATUS_LABELS.get(r["status"], r["status"] or "—")
+        by_status[st] = by_status.get(st, 0) + 1
+        ag = (r["assignee"] or "—").strip() or "—"
+        by_assignee[ag] = by_assignee.get(ag, 0) + 1
+        m = r["created_at"].strftime("%Y-%m") if r["created_at"] else "—"
+        by_month[m] = by_month.get(m, 0) + 1
+
+    kpis = [("إجمالي الطلبات", len(rows))] + [(k, v) for k, v in sorted(by_status.items(), key=lambda x: -x[1])][:4]
+    span = max(1, ncols // max(1, len(kpis)))
+    col = 1
+    for label, value in kpis:
+        last = min(col + span - 1, ncols)
+        ws.merge_cells(start_row=3, start_column=col, end_row=3, end_column=last)
+        lc = ws.cell(3, col, label)
+        lc.font = Font(size=9, color="A8CFCB")
+        lc.fill = fill(_XL_FILL_META)
+        lc.alignment = Alignment(horizontal="center")
+        ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=last)
+        vc = ws.cell(4, col, value)
+        vc.font = Font(bold=True, size=12, color="FFFFFF")
+        vc.fill = fill(_XL_FILL_META)
+        vc.alignment = Alignment(horizontal="center")
+        col = last + 1
+    ws.row_dimensions[3].height = 16
+    ws.row_dimensions[4].height = 22
+
+    HROW = 5
+    for ci, (title, width) in enumerate(cols, 1):
+        cell = ws.cell(HROW, ci, title)
+        cell.font = Font(bold=True, color="FFFFFF", size=10)
+        cell.fill = fill(_XL_FILL_HEADER)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(ci)].width = width
+    ws.row_dimensions[HROW].height = 28
+
+    wrap_cols = {5, 8, 9}
+    rr = HROW + 1
+    for idx, r in enumerate(rows):
+        is_rejected = r["status"] == "rejected"
+        values = [
+            r["id"],
+            r["conversation_id"] if r["conversation_id"] is not None else "—",
+            (r["customer_name"] or "—").strip(),
+            (r["order_number"] or "—").strip(),
+            (r["reason"] or "—").strip(),
+            REFUND_LABELS.get(r["refund_method"] or "bank_account", r["refund_method"] or "—"),
+            STATUS_LABELS.get(r["status"], r["status"] or "—"),
+            (r["accountant_note"] or "—").strip(),
+            (r["reject_reason"] or "—").strip(),
+            (r["assignee"] or "—").strip() or "—",
+            "نعم" if r["receipt_name"] else "لا",
+            _fmt_dt(r["contacted_at"], True),
+            _fmt_dt(r["created_at"]),
+            _fmt_dt(r["return_created_at"]),
+            _fmt_dt(r["updated_at"], True),
+        ]
+        row_fill = fill(_XL_FILL_REJECTED) if is_rejected else (fill(_XL_FILL_STRIPE) if idx % 2 else None)
+        for ci, val in enumerate(values, 1):
+            cell = ws.cell(rr, ci, val)
+            cell.border = border
+            if row_fill:
+                cell.fill = row_fill
+            if ci in wrap_cols:
+                cell.alignment = Alignment(horizontal="right", wrap_text=True, vertical="top")
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            if ci == 7 and is_rejected:
+                cell.font = Font(bold=True, color="C0392B")
+        rr += 1
+
+    tcell = ws.cell(rr, 1, "الإجمالي")
+    tcell.font = Font(bold=True, color="FFFFFF")
+    tcell.fill = fill(_XL_FILL_TOTAL)
+    tcell.alignment = Alignment(horizontal="center")
+    for ci in range(2, ncols + 1):
+        cell = ws.cell(rr, ci, f"{len(rows)} طلب" if ci == 2 else "")
+        cell.fill = fill(_XL_FILL_TOTAL)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = border
+    ws.row_dimensions[rr].height = 24
+
+    note = ws.cell(rr + 2, 1,
+                   "ملاحظة: البيانات البنكية (الآيبان ورقم الحساب ومرجع الاسترداد) مستبعدة عمداً من هذا التقرير — "
+                   "تظهر في صفحة المحاسب فقط. الصفوف المرفوضة بخلفية حمراء.")
+    note.font = Font(size=9, color="5A6B7D")
+    ws.merge_cells(start_row=rr + 2, start_column=1, end_row=rr + 2, end_column=ncols)
+
+    ws.freeze_panes = ws.cell(HROW + 1, 1)
+    ws.auto_filter.ref = f"A{HROW}:{get_column_letter(ncols)}{rr - 1}"
+
+    # ── Sheet 2: breakdown ──
+    ws2 = wb.create_sheet("الملخص")
+    ws2.sheet_view.rightToLeft = True
+    for letter, width in (("A", 26), ("B", 14)):
+        ws2.column_dimensions[letter].width = width
+
+    def block(start_row, title, data):
+        ws2.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=2)
+        h = ws2.cell(start_row, 1, title)
+        h.font = Font(bold=True, size=12, color="FFFFFF")
+        h.fill = fill(_XL_FILL_TITLE)
+        h.alignment = Alignment(horizontal="center")
+        r = start_row + 1
+        for ci, t in enumerate(["البند", "عدد الطلبات"], 1):
+            hc = ws2.cell(r, ci, t)
+            hc.font = Font(bold=True, color="FFFFFF")
+            hc.fill = fill(_XL_FILL_HEADER)
+            hc.alignment = Alignment(horizontal="center")
+            hc.border = border
+        r += 1
+        for k, v in sorted(data.items(), key=lambda x: -x[1]):
+            ws2.cell(r, 1, k).border = border
+            vc = ws2.cell(r, 2, v)
+            vc.alignment = Alignment(horizontal="center")
+            vc.border = border
+            r += 1
+        tc = ws2.cell(r, 1, "الإجمالي")
+        tc.font = Font(bold=True, color="FFFFFF")
+        tc.fill = fill(_XL_FILL_TOTAL)
+        tc.border = border
+        vc = ws2.cell(r, 2, sum(data.values()))
+        vc.font = Font(bold=True, color="FFFFFF")
+        vc.fill = fill(_XL_FILL_TOTAL)
+        vc.alignment = Alignment(horizontal="center")
+        vc.border = border
+        return r + 3
+
+    nxt = block(1, "حسب الحالة", by_status)
+    nxt = block(nxt, "حسب الموظف", by_assignee)
+    block(nxt, "حسب الشهر", by_month)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@app.get("/returns/api/team-requests/export")
+async def team_requests_export(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    assignee: Optional[str] = None,
+    q: Optional[str] = None,
+    ids: Optional[str] = None,
+    scope: Optional[str] = None,
+):
+    """Excel of every row matching the filters — deliberately uncapped."""
+    for label, val in (("date_from", date_from), ("date_to", date_to)):
+        if val and not re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+            raise HTTPException(status_code=400, detail=f"{label} يجب أن يكون بصيغة YYYY-MM-DD")
+    if status and status not in STATUS_LABELS:
+        raise HTTPException(status_code=400, detail="حالة غير معروفة")
+
+    id_list = None
+    if ids and ids.strip():
+        try:
+            id_list = [int(x) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="قائمة المعرّفات غير صالحة")
+        if not id_list:
+            id_list = None
+
+    rows = await _fetch_team_rows(date_from, date_to, status, assignee, q, id_list)
+
+    parts = []
+    if date_from or date_to:
+        parts.append(f"الفترة: {date_from or 'البداية'} → {date_to or 'اليوم'}")
+    else:
+        parts.append("الفترة: كل الطلبات")
+    if status:
+        parts.append(f"الحالة: {STATUS_LABELS.get(status, status)}")
+    if assignee:
+        parts.append(f"الموظف: {assignee}")
+    if q and q.strip():
+        parts.append(f"بحث: {q.strip()}")
+    if scope and scope.strip():
+        parts.append(f"العرض: {scope.strip()}")
+    period_label = "  |  ".join(parts)
+
+    buf = _build_returns_workbook(rows, period_label)
+    fname = f"returns_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={fname}",
+            "X-Total-Count": str(len(rows)),
+        },
+    )
 
 @app.get("/returns/team-requests", response_class=HTMLResponse)
 async def team_page():
@@ -1187,7 +1516,14 @@ header p{font-size:12.5px;color:var(--soft);margin-top:2px}
 .agent .arej{display:inline-block;font-size:10px;font-weight:700;color:var(--rej);background:var(--rejsoft);border-radius:999px;padding:1px 7px;margin-top:4px}
 .agent.active .arej{background:rgba(255,255,255,.22);color:#fff}
 .tools select,.tools input{font-family:inherit;font-size:13.5px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;background:#fff}
-.refresh{margin-inline-start:auto;background:var(--brand);color:#fff;border:none;border-radius:10px;padding:8px 15px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer}
+.refresh{background:var(--brand);color:#fff;border:none;border-radius:10px;padding:8px 15px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer}
+.dategrp{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--soft)}
+.dategrp input[type=date]{padding:7px 10px}
+.clearf{background:#fff;color:var(--soft);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-family:inherit;font-size:12.5px;cursor:pointer}
+.clearf:hover{background:#f4f6f8}
+.xbtn{margin-inline-start:auto;background:#1f7a4d;color:#fff;border:none;border-radius:10px;padding:8px 15px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap}
+.xbtn:hover{background:#19643f}
+.xbtn:disabled{opacity:.55;cursor:not-allowed}
 .count{font-size:12.5px;color:var(--soft)}
 .rejbar{background:var(--rejsoft);border:1px solid #f3c6c1;color:var(--rej);border-radius:12px;padding:12px 15px;margin-bottom:14px;font-size:13px;font-weight:600;display:none}
 .rejbar.show{display:block}
@@ -1235,9 +1571,15 @@ footer{text-align:center;margin-top:22px;font-size:11.5px;color:var(--soft)}
     <button class="tab tab-old" data-tab="old_rejected" onclick="setTab('old_rejected',this)">قديمة — مرفوضة <span class="cnt" id="tcnt-old_rejected">0</span></button>
   </div>
   <div class="tools">
+    <span class="dategrp">
+      من <input type="date" id="fdate_from" onchange="render()">
+      إلى <input type="date" id="fdate_to" onchange="render()">
+    </span>
     <input id="fsearch" placeholder="بحث بالاسم أو رقم المحادثة أو الطلب…" oninput="render()">
+    <button class="clearf" onclick="clearFilters()">مسح الفلاتر</button>
     <span class="count" id="count"></span>
     <button class="refresh" onclick="load()">تحديث ⟳</button>
+    <button class="xbtn" id="xbtn" onclick="exportExcel()" title="تصدير الطلبات الظاهرة حالياً إلى ملف Excel">📥 تصدير Excel</button>
   </div>
   <div class="tablewrap">
     <table>
@@ -1352,6 +1694,52 @@ function renderAgents(){
   });
   box.innerHTML=html;
 }
+var VISIBLE=[];
+// Date filter runs on created_at (when the request was raised), which is the
+// field the accountant reconciles against.
+function inDateRange(x,df,dt){
+  var raw=x.created_at||x.return_created_at;
+  if(!raw)return !(df||dt);
+  var d=String(raw).slice(0,10);
+  if(df && d<df)return false;
+  if(dt && d>dt)return false;
+  return true;
+}
+function clearFilters(){
+  document.getElementById("fdate_from").value="";
+  document.getElementById("fdate_to").value="";
+  document.getElementById("fsearch").value="";
+  render();
+}
+function tabLabel(){
+  var b=document.querySelector('#tabs .tab[data-tab="'+CURTAB+'"]');
+  if(!b)return "";
+  return b.textContent.replace(/\s*\d+\s*$/,"").trim();
+}
+function exportExcel(){
+  var btn=document.getElementById("xbtn");
+  if(!VISIBLE.length){alert("لا توجد طلبات مطابقة للفلاتر الحالية.");return}
+  btn.disabled=true;var old=btn.textContent;btn.textContent="جارٍ التصدير…";
+  var p=new URLSearchParams();
+  p.set("ids",VISIBLE.map(function(x){return x.id}).join(","));
+  var df=document.getElementById("fdate_from").value;
+  var dt=document.getElementById("fdate_to").value;
+  if(df)p.set("date_from",df);
+  if(dt)p.set("date_to",dt);
+  var qq=document.getElementById("fsearch").value.trim();
+  if(qq)p.set("q",qq);
+  if(CURAGENT)p.set("assignee",CURAGENT);
+  var sc=tabLabel();if(sc)p.set("scope",sc);
+  fetch(API+"/export?"+p.toString())
+    .then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.blob()})
+    .then(function(b){
+      var u=URL.createObjectURL(b),a=document.createElement("a");
+      a.href=u;a.download="returns_"+new Date().toISOString().slice(0,10)+".xlsx";
+      document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);
+    })
+    .catch(function(e){alert("تعذّر التصدير: "+e.message)})
+    .finally(function(){btn.disabled=false;btn.textContent=old});
+}
 function render(){
   renderAgents();
   // agent scope first, then the status tab, then search
@@ -1360,12 +1748,20 @@ function render(){
   });
   updateTabCounts(scope);
   var q=document.getElementById("fsearch").value.trim().toLowerCase();
+  var df=document.getElementById("fdate_from").value;
+  var dt=document.getElementById("fdate_to").value;
   var list=scope.filter(function(x){
     if(!inTab(x))return false;
+    if(!inDateRange(x,df,dt))return false;
     if(q){var h=((x.customer_name||"")+" "+(x.conversation_id||"")+" "+(x.order_number||"")).toLowerCase();if(h.indexOf(q)<0)return false}
     return true;
   });
-  document.getElementById("count").textContent=list.length+" طلب";
+  // Keep the exact rows on screen so the Excel export can send their ids and
+  // reproduce this view byte-for-byte instead of re-deriving the filters.
+  VISIBLE=list;
+  var totalTxt=list.length+" طلب";
+  if(list.length!==DATA.length){totalTxt+=" من أصل "+DATA.length}
+  document.getElementById("count").textContent=totalTxt;
   // Alert counts ONLY rejected requests the agent has NOT yet followed up on.
   // Pressing "تم التواصل" sets contacted_at → the request drops out of this count.
   var rejected=list.filter(function(x){return x.status==="rejected" && !x.contacted_at});
