@@ -2075,6 +2075,22 @@ footer{text-align:center;margin-top:22px;font-size:11.5px;color:var(--soft)}
   <div class="empty" id="empty">لا توجد طلبات مرفوعة بعد.</div>
   <footer>QAYDAO · الطلبات المرفوعة · البيانات البنكية غير معروضة هنا لدواعي الخصوصية — تظهر في نموذج الإدخال فقط</footer>
 </div>
+<div class="modal-bg" id="imodal">
+  <div class="modal">
+    <h3>تعليم الطلب</h3>
+    <p class="sub" id="isub"></p>
+    <div class="opt">
+      <button id="opt-complaint" onclick="pickIssue('complaint')">&#9888; شكوى</button>
+      <button id="opt-case" onclick="pickIssue('case')">&#9878; قضية</button>
+      <button id="opt-none" class="none" onclick="pickIssue(null)">إزالة التعليم</button>
+    </div>
+    <textarea id="inote" placeholder="تفاصيل الشكوى أو القضية (اختياري)…"></textarea>
+    <div class="acts">
+      <button class="btn-save" id="isave" onclick="saveIssue()">حفظ</button>
+      <button class="btn-cancel" onclick="closeIssue()">إلغاء</button>
+    </div>
+  </div>
+</div>
 <script>
 var API="/returns/api/team-requests";
 var EMAIL="financial@qaydao.com";
