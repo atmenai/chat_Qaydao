@@ -1,6 +1,5 @@
-/* QAYDAO Quality Guard — Reports menu injector. Loaded via one <script> tag.
-   Adds «تقارير الجودة» and «إعدادات الجودة» into the native Reports submenu.
-   Renders the Quality Guard page inline. Admin-gating/identity handled by QG backend. */
+/* QAYDAO Quality Guard — Reports menu injector + in-conversation notes toggle.
+   Loaded via one <script> tag. */
 (function () {
   "use strict";
   var QG_BASE = "/quality-guard";
@@ -52,9 +51,19 @@
       "#qg-frame-wrap.show{display:block}" +
       "#qg-frame-wrap iframe{width:100%;height:100%;border:0}" +
       "#qg-frame-close{position:absolute;inset-inline-end:14px;top:10px;z-index:51;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:6px 12px;cursor:pointer;font-family:inherit}" +
+      /* hide QG notes from the conversation view (display only, never deleted) */
       "body.qg-notes-hidden [data-qg-note-row]{display:none!important}" +
-      "#qg-toggle-notes{cursor:pointer}" +
-      "#qg-toggle-notes.qg-toggle-on{color:#9a6700!important}";
+      /* sticky toolbar anchored INSIDE the conversation message area */
+      ".qg-notes-toolbar{position:sticky;top:0;z-index:20;display:flex;justify-content:flex-end;" +
+        "padding:6px 10px;background:linear-gradient(#fff,rgba(255,255,255,.92));backdrop-filter:saturate(1.2) blur(2px);" +
+        "border-bottom:1px solid #eceef1}" +
+      "#qg-toggle-notes{cursor:pointer;border:1px solid #d7dbe0;background:#fff;color:#3c4858;border-radius:8px;" +
+        "padding:5px 12px;font-family:inherit;font-size:12.5px;font-weight:600;line-height:1.4;white-space:nowrap;" +
+        "box-shadow:0 1px 2px rgba(0,0,0,.04);transition:background .15s,border-color .15s}" +
+      "#qg-toggle-notes:hover{background:#f5f7f9}" +
+      "#qg-toggle-notes.qg-toggle-on{background:#fff8e8;border-color:#f0c36d;color:#9a6700}" +
+      "#qg-toggle-notes .qg-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#1f6feb;margin-inline-end:6px;vertical-align:middle}" +
+      "#qg-toggle-notes.qg-toggle-on .qg-dot{background:#e0a106}";
     document.head.appendChild(st);
   }
 
@@ -78,107 +87,120 @@
     wrap.classList.add("show");
   }
 
-  // ---- Point 3: hide/show Quality Guard notes in the conversation view (no deletion) ----
+  /* ---------- in-conversation Quality-Guard notes toggle ---------- */
   var QG_NOTE_MARK = "\u062a\u0646\u0628\u064a\u0647 \u062c\u0648\u062f\u0629 \u062f\u0627\u062e\u0644\u064a"; // «تنبيه جودة داخلي»
   var LBL_HIDE = "\u0625\u062e\u0641\u0627\u0621 \u062a\u0646\u0628\u064a\u0647\u0627\u062a \u0627\u0644\u062c\u0648\u062f\u0629"; // إخفاء تنبيهات الجودة
   var LBL_SHOW = "\u0625\u0638\u0647\u0627\u0631 \u062a\u0646\u0628\u064a\u0647\u0627\u062a \u0627\u0644\u062c\u0648\u062f\u0629"; // إظهار تنبيهات الجودة
 
-  function tagQgNotes() {
-    // find message bubbles that contain the QG marker; tag the closest message row
-    var nodes = document.querySelectorAll("div,li,article,section");
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      if (el.getAttribute && el.getAttribute("data-qg-note-row")) continue;
-      // shallow text check to avoid tagging huge containers
-      if (el.children.length <= 6 && (el.textContent || "").indexOf(QG_NOTE_MARK) > -1) {
-        // climb to the message-row wrapper (Chatwoot wraps each message)
-        var row = el;
-        for (var k = 0; k < 6 && row && row.parentElement; k++) {
-          var cls = (row.className || "") + "";
-          if (/message|conversation__message|wrap|bubble/i.test(cls)) break;
-          row = row.parentElement;
-        }
-        if (row) row.setAttribute("data-qg-note-row", "1");
-      }
-    }
-  }
-
   function isConversationView() {
-    return /\/conversations?\//.test(location.pathname) || /\/(accounts)\/\d+\/(conversations|inbox)/.test(location.pathname);
+    return /\/(conversations?|inbox|custom_view|mentions|unattended|label|team)\/?/.test(location.pathname) &&
+           !onReportsPage();
   }
 
-  var LBL_MSGS = "\u0627\u0644\u0631\u0633\u0627\u0626\u0644";            // الرسائل
-  var LBL_PRODS = "\u0625\u062f\u0627\u0631\u0629 \u0627\u0644\u0645\u0646\u062a\u062c\u0627\u062a"; // إدارة المنتجات
-
-  function _leafText(el) {
-    // text of an element treated as a tab label (small, few descendants)
-    if (!el) return "";
-    if (el.children && el.children.length > 4) return "";
-    return (el.textContent || "").trim();
-  }
-
-  function _findTab(label) {
-    var cand = document.querySelectorAll("a,button,div,span,li");
-    for (var i = 0; i < cand.length; i++) {
-      if (_leafText(cand[i]) === label) return cand[i];
+  // Precisely tag ONLY Quality-Guard note bubbles (never the whole conversation).
+  // A QG note is a private/internal note whose text contains the QG marker.
+  // We tag the SMALLEST wrapper that represents that single message, with a hard
+  // guard: the wrapper must contain exactly ONE QG marker (else it's a big container).
+  function _markerCount(el) {
+    var html = el.textContent || "";
+    var idx = 0, n = 0;
+    while (true) {
+      idx = html.indexOf(QG_NOTE_MARK, idx);
+      if (idx === -1) break;
+      n++; idx += QG_NOTE_MARK.length;
     }
-    return null;
+    return n;
   }
 
-  // Return the actual tab element + its parent bar, ONLY when both tabs are siblings
-  // (this guarantees we found the real conversation tab-bar, not a floating header).
-  function findTabBar() {
-    var prods = _findTab(LBL_PRODS);
-    var msgs = _findTab(LBL_MSGS);
-    if (!prods || !msgs) return null;
-    // climb from each to find a common ancestor that directly holds BOTH as descendants
-    // prefer the nearest shared parent
-    var pa = prods;
-    for (var d = 0; d < 5 && pa; d++) {
-      if (pa.contains(msgs) && pa !== msgs) {
-        // pa is a shared ancestor; use the level that holds both tab nodes
-        return { bar: pa, sampleTab: prods };
+  function tagQgNotesAndFindArea() {
+    // 1) find the leaf elements that directly contain the QG marker text
+    var all = document.querySelectorAll("div,li,article,section,p,span");
+    var leaves = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var txt = el.textContent || "";
+      if (txt.indexOf(QG_NOTE_MARK) === -1) continue;
+      // a "leaf" carrier: none of its children individually still contains the marker
+      var childHasIt = false;
+      for (var c = 0; c < el.children.length; c++) {
+        if ((el.children[c].textContent || "").indexOf(QG_NOTE_MARK) > -1) { childHasIt = true; break; }
       }
-      pa = pa.parentElement;
+      if (!childHasIt) leaves.push(el);
     }
-    return null;
+    // 2) for each leaf, climb to the single-message wrapper — but STOP before any
+    //    element that would swallow more than this one note (guard against big containers)
+    var tagged = [];
+    for (var j = 0; j < leaves.length; j++) {
+      var row = leaves[j];
+      var chosen = row;
+      var p = row.parentElement;
+      for (var k = 0; k < 8 && p; k++) {
+        // never climb into an element that holds MORE than one QG marker -> would hide siblings
+        if (_markerCount(p) > 1) break;
+        // never climb into an obvious whole-conversation / list container
+        var cls = (p.className || "") + "";
+        if (/conversation-panel|messages-?wrap|messages-?list|conversation-?wrap|conversation__panel|inbox|ProseMirror-host/i.test(cls)) break;
+        chosen = p;
+        p = p.parentElement;
+      }
+      if (chosen && !chosen.getAttribute("data-qg-note-row")) {
+        chosen.setAttribute("data-qg-note-row", "1");
+      }
+      if (chosen) tagged.push(chosen);
+    }
+    // 3) find the scrollable messages area (to host the sticky toolbar)
+    var area = null;
+    if (tagged.length) {
+      var q = tagged[0];
+      for (var d = 0; d < 14 && q; d++) {
+        var oy = "";
+        try { oy = getComputedStyle(q).overflowY; } catch (e) {}
+        if ((oy === "auto" || oy === "scroll") && (q.scrollHeight || 0) > (q.clientHeight || 0) + 20) { area = q; break; }
+        q = q.parentElement;
+      }
+    }
+    if (!area) {
+      area = document.querySelector(".conversation-panel, .messages-wrap, [class*='conversationPanel'], ul.conversation-panel");
+    }
+    return area;
   }
 
-  function injectToggle() {
-    if (!isConversationView()) return;
-    tagQgNotes();
-    if (document.getElementById("qg-toggle-notes")) return;
-    var found = findTabBar();
-    if (!found || !found.bar) return;
-    // build the toggle as a clone of a real tab so it matches the tab design exactly
-    var sample = found.sampleTab;
-    var btn = sample.cloneNode(true);
+  function buildToggleButton() {
+    var btn = document.createElement("button");
     btn.id = "qg-toggle-notes";
-    if (btn.tagName === "A") { btn.removeAttribute("href"); }
-    btn.setAttribute("role", "button");
-    btn.style.cursor = "pointer";
-    btn.classList.remove("router-link-active", "router-link-exact-active", "active", "is-active");
+    btn.type = "button";
     var hidden = document.body.classList.contains("qg-notes-hidden");
-    // set the visible label text (replace inner text node, keep tab styling)
-    var lblNode = btn.querySelector("span span") || btn.querySelector("span") || btn;
-    lblNode.textContent = hidden ? LBL_SHOW : LBL_HIDE;
+    btn.innerHTML = '<span class="qg-dot"></span><span class="qg-lbl"></span>';
+    btn.querySelector(".qg-lbl").textContent = hidden ? LBL_SHOW : LBL_HIDE;
     if (hidden) btn.classList.add("qg-toggle-on");
     btn.addEventListener("click", function (e) {
       e.preventDefault(); e.stopPropagation();
       var nowHidden = document.body.classList.toggle("qg-notes-hidden");
-      tagQgNotes();
-      var ln = btn.querySelector("span span") || btn.querySelector("span") || btn;
-      ln.textContent = nowHidden ? LBL_SHOW : LBL_HIDE;
+      tagQgNotesAndFindArea();
+      btn.querySelector(".qg-lbl").textContent = nowHidden ? LBL_SHOW : LBL_HIDE;
       btn.classList.toggle("qg-toggle-on", nowHidden);
     });
-    // insert right after the «إدارة المنتجات» tab, inside the same bar
-    if (sample.parentElement) {
-      sample.parentElement.insertBefore(btn, sample.nextSibling);
-    } else {
-      found.bar.appendChild(btn);
-    }
+    return btn;
   }
 
+  function injectToggle() {
+    if (!isConversationView()) return;
+    var area = tagQgNotesAndFindArea();
+    if (!area) return; // no conversation messages area yet
+    // already present and still attached?
+    var existing = document.getElementById("qg-toggle-notes");
+    if (existing && document.body.contains(existing)) return;
+    // build a sticky toolbar pinned to the top of the messages area, INSIDE the chat box
+    var bar = document.createElement("div");
+    bar.className = "qg-notes-toolbar";
+    bar.setAttribute("data-qg-toolbar", "1");
+    bar.appendChild(buildToggleButton());
+    // insert as the first child of the messages area so it sticks at the top inside the box
+    if (area.firstChild) area.insertBefore(bar, area.firstChild);
+    else area.appendChild(bar);
+  }
+
+  /* ---------- reports submenu items ---------- */
   function inject() {
     if (!onReportsPage()) return;
     var found = findContainer();
@@ -191,7 +213,11 @@
     found.container.setAttribute(FLAG, "1");
   }
 
-  function tick() { try { inject(); } catch (e) {} try { ensureStyles(); injectToggle(); } catch (e) {} }
+  function tick() {
+    try { ensureStyles(); } catch (e) {}
+    try { inject(); } catch (e) {}
+    try { injectToggle(); } catch (e) {}
+  }
   function start() {
     new MutationObserver(tick).observe(document.body, { childList: true, subtree: true });
     setInterval(tick, 1500);
