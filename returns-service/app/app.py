@@ -1043,6 +1043,8 @@ header p{font-size:13px;color:var(--soft);margin-top:2px}
 .tab-old{border-style:dashed;color:#8a92a0}
 .tab-old:hover{border-color:#8a92a0;color:#5a6b7d}
 .tab-old.active{background:#5a6b7d;border-color:#5a6b7d;border-style:solid;color:#fff}
+.tab-issue{color:#b3261e}
+.tab-issue.active{background:#b3261e;color:#fff;border-color:#b3261e}
 .refresh{background:var(--brand);color:#fff;border:none;border-radius:10px;padding:9px 16px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer}
 .dategrp{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--soft)}
 .dategrp input[type=date]{font-family:inherit;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#fff}
@@ -1146,6 +1148,7 @@ footer{text-align:center;margin-top:26px;font-size:11.5px;color:var(--soft)}
     <button class="tab" data-tab="done_salla" id="tab-done_salla" style="display:none" onclick="setTab('done_salla',this)">تم التعميد من المشتريات <span class="cnt" id="cnt-done_salla">0</span></button>
     <button class="tab tab-old" data-tab="old_done" onclick="setTab('old_done',this)">قديمة — تم الإرجاع <span class="cnt" id="cnt-old_done">0</span></button>
     <button class="tab tab-old" data-tab="old_rejected" onclick="setTab('old_rejected',this)">قديمة — مرفوضة <span class="cnt" id="cnt-old_rejected">0</span></button>
+    <button class="tab tab-issue" data-tab="issues" onclick="setTab('issues',this)">&#9873; شكاوى وقضايا <span class="cnt" id="cnt-issues">0</span></button>
     <button class="tab" data-tab="all" onclick="setTab('all',this)">الكل <span class="cnt" id="cnt-all">0</span></button>
   </div>
   <div class="tools">
@@ -1211,14 +1214,15 @@ function inTab(x){
     case "done_salla":   return x.status==="done_salla";
     case "old_done":     return x.status==="done"     &&  isOld(x);
     case "old_rejected": return x.status==="rejected" &&  isOld(x);
-    case "issues":       return !!x.issue_type;
+    case "issues":       return !!x.issue_type && x.status!=="done";
     default:             return true;
   }
 }
 function updateCounts(){
-  var c={new:0,will:0,doing:0,done:0,rejected:0,done_salla:0,old_done:0,old_rejected:0};
+  var c={new:0,will:0,doing:0,done:0,rejected:0,done_salla:0,old_done:0,old_rejected:0,issues:0};
   DATA.forEach(function(x){
     var old=isOld(x);
+    if(x.issue_type && x.status!=="done")c.issues++;
     if(x.status==="new")c.new++;
     else if(x.status==="will")c.will++;
     else if(x.status==="doing")c.doing++;
@@ -1231,6 +1235,7 @@ function updateCounts(){
   set("cnt-done",c.done);set("cnt-rejected",c.rejected);set("cnt-done_salla",c.done_salla);
   set("cnt-old_done",c.old_done);set("cnt-old_rejected",c.old_rejected);
   set("cnt-all",DATA.length);
+  set("cnt-issues",c.issues);
 }
 // Date filter runs on created_at — the field the accountant reconciles against.
 var VISIBLE=[];
@@ -1295,7 +1300,7 @@ function render(){
   VISIBLE=list;
   var txt=list.length+" طلب";
   if(list.length!==DATA.length)txt+=" من أصل "+DATA.length;
-  var fl=list.filter(function(x){return !!x.issue_type}).length;
+  var fl=list.filter(function(x){return !!x.issue_type && x.status!=="done"}).length;
   if(fl)txt+=" · "+fl+" شكوى/قضية";
   document.getElementById("count").textContent=txt;
   var g=document.getElementById("grid"),e=document.getElementById("empty");
