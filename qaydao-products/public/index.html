@@ -91,6 +91,10 @@
           <span x-text="(stats?.master?.in_stock || 0).toLocaleString('ar-SA')"></span> في المخزون ·
           <span x-text="stats?.master?.unique_categories || 0"></span> فئة
         </div>
+        <div class="text-xs opacity-70 mt-1">
+          🕒 آخر تحديث: <span x-text="timeAgo(stats?.sync_status?.master?.last_update)"></span>
+          · مزامنة شاملة: <span x-text="timeAgo(stats?.sync_status?.last_reconcile?.ts)"></span>
+        </div>
       </div>
       <div class="flex flex-col items-end gap-2">
         <button @click="syncAll(false)" :disabled="syncing"
@@ -122,6 +126,7 @@
         <span x-text="stats?.systems?.studio?.with_salla_id || 0"></span> مع Salla ID ·
         <span x-text="stats?.systems?.studio?.active || 0"></span> نشط
       </div>
+      <div class="text-xs text-gray-400 mb-2">🕒 آخر تحديث: <span x-text="timeAgo(stats?.sync_status?.studio?.last_update)"></span></div>
       <button @click="syncOne('studio')" :disabled="syncing"
         class="w-full bg-purple-500 text-white text-sm font-bold py-2 rounded-lg hover:bg-purple-600 transition disabled:opacity-50">
         🔄 مزامنة Studio
@@ -146,6 +151,7 @@
         <span x-text="stats?.systems?.sales?.with_sku || 0"></span> مع SKU ·
         <span x-text="stats?.systems?.sales?.active || 0"></span> نشط
       </div>
+      <div class="text-xs text-gray-400 mb-2">🕒 آخر تحديث: <span x-text="timeAgo(stats?.sync_status?.sales?.last_update)"></span></div>
       <button @click="syncOne('sales')" :disabled="syncing"
         class="w-full bg-blue-500 text-white text-sm font-bold py-2 rounded-lg hover:bg-blue-600 transition disabled:opacity-50">
         🔄 مزامنة Sales
@@ -496,6 +502,17 @@ function dashboard() {
     formatDate(d) {
       if (!d) return '-';
       return new Date(d).toLocaleString('ar-SA', { dateStyle: 'short', timeStyle: 'short' });
+    },
+
+    timeAgo(d) {
+      if (!d) return '—';
+      const diff = Date.now() - new Date(d).getTime();
+      if (isNaN(diff)) return '—';
+      const s = Math.floor(diff / 1000);
+      if (s < 60) return 'الآن';
+      const m = Math.floor(s / 60); if (m < 60) return 'قبل ' + m + ' دقيقة';
+      const h = Math.floor(m / 60); if (h < 24) return 'قبل ' + h + ' ساعة';
+      const dd = Math.floor(h / 24); return 'قبل ' + dd + ' يوم';
     },
 
     handleDrop(e) {

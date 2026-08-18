@@ -16,6 +16,7 @@ const syncEngine = require('./sync-engine');
 const captain = require('./captain-manager');
 const unifiedImport = require('./unified-import');
 const stockEnrich = require('./stock-enrich');
+const hubPublish = require('./hub-publish'); // حبة 2b — ناشر اللوحة → Hub
 
 const PORT = process.env.PORT || 3601;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'qaydao2026';
@@ -23,7 +24,7 @@ const ADMIN_HASH = bcrypt.hashSync(ADMIN_PASSWORD, 10);
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 
 // Allow embedding in Chatwoot
@@ -243,6 +244,44 @@ app.post('/products/api/logout', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
+//  HUB LIVE INGEST — master_products يتحدّث فورياً من ناقل التوزيع
+//  عام (بلا requireAuth)، موثّق بـ HMAC-SHA256
+// ════════════════════════════════════════════════════════════
+app.post('/products/api/hub/master-ingest', async (req, res) => {
+  try {
+    const secret = process.env.MASTER_INGEST_SECRET;
+    if (!secret) return res.status(503).json({ error: 'not_configured' });
+    const sig = req.get('X-QAYDAO-Signature') || '';
+    const expected = crypto.createHmac('sha256', secret).update(req.rawBody || Buffer.from('')).digest('hex');
+    if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+      return res.status(401).json({ error: 'bad_signature' });
+    }
+    const evt = (req.body && req.body.event) || '';
+    const d = (req.body && req.body.data) || {};
+    const sallaId = String(d.salla_id || d.id || '');
+    if (!sallaId) return res.status(422).json({ error: 'no_salla_id' });
+
+    if (evt === 'product.deleted') {
+      await db.query("UPDATE master_products SET deleted_at=now(), is_active=false, updated_at=now() WHERE salla_id=$1", [sallaId]);
+      return res.json({ ok: true, action: 'deleted', salla_id: sallaId });
+    }
+
+    const priceRegular = Number(d.price != null ? d.price : 0) || 0;
+    const priceDisc = (d.sale_price !== null && d.sale_price !== undefined) ? (Number(d.sale_price) || 0) : null;
+    const qty = (d.availability === 'in') ? 100 : 0;
+    const status = d.is_active ? 'active' : 'inactive';
+    await db.query(
+      "INSERT INTO master_products (salla_id,name,sku,price_regular,price_discounted,quantity_available,status,image_url,description,category_main,product_url,is_active,deleted_at,source,last_synced_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,NULL,'salla_live',now(),now()) ON CONFLICT (salla_id) DO UPDATE SET name=EXCLUDED.name,sku=EXCLUDED.sku,price_regular=EXCLUDED.price_regular,price_discounted=EXCLUDED.price_discounted,quantity_available=EXCLUDED.quantity_available,status=EXCLUDED.status,image_url=EXCLUDED.image_url,description=EXCLUDED.description,category_main=EXCLUDED.category_main,product_url=EXCLUDED.product_url,is_active=true,deleted_at=NULL,source='salla_live',last_synced_at=now(),updated_at=now()",
+      [sallaId, d.name || null, d.sku || null, priceRegular, priceDisc, qty, status, d.image_url || null, d.description || null, d.category || null, d.product_url || null]
+    );
+    return res.json({ ok: true, action: 'upserted', salla_id: sallaId });
+  } catch (e) {
+    console.error('[master-ingest]', e.message);
+    return res.status(500).json({ error: 'ingest_failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
 //  EMPLOYEE UI
 // ════════════════════════════════════════════════════════════
 
@@ -289,6 +328,27 @@ app.get('/products/api/status', requireAuth, async (req, res) => {
       adapters.captain.getStats(db.pool)
     ]);
 
+    // sync_status — آخر تحديث لكل منصّة + آخر مزامنة شاملة
+    let syncStatus = {};
+    try {
+      const [studioLast, salesLast, masterLastRow] = await Promise.all([
+        adapters.studio.lastUpdated(),
+        adapters.sales.lastUpdated(),
+        db.one("SELECT MAX(last_synced_at) AS last FROM master_products WHERE deleted_at IS NULL")
+      ]);
+      let reconcile = null;
+      try {
+        const meta = JSON.parse(fs.readFileSync('/root/qaydao-products/data/live_meta.json', 'utf8'));
+        reconcile = { ts: meta.ts || meta.finished_at || null, count: meta.count || null, had_error: !!meta.had_error };
+      } catch (_) {}
+      syncStatus = {
+        master: { last_update: masterLastRow && masterLastRow.last ? masterLastRow.last : null },
+        studio: { last_update: studioLast },
+        sales:  { last_update: salesLast },
+        last_reconcile: reconcile
+      };
+    } catch (e) { syncStatus = { error: e.message }; }
+
     // AI events stats (last 7 days)
     const aiStats = await db.one(`
       SELECT
@@ -302,6 +362,7 @@ app.get('/products/api/status', requireAuth, async (req, res) => {
     `);
 
     res.json({
+      sync_status: syncStatus,
       master: {
         total_products: parseInt(masterRow.total),
         available: parseInt(masterRow.available || 0),
@@ -444,11 +505,13 @@ app.post('/products/api/upload', requireAuth, upload.single('csv'), async (req, 
     const content = fileBuffer.toString('utf-8').replace(/^\ufeff/, '');
     const records = await new Promise((resolve, reject) => {
       parse(content, {
-        columns: true,
+        columns: true,          // line 1 IS the header (Salla export). Do NOT skip it.
         skip_empty_lines: true,
         relax_quotes: true,
-        relax_column_count: true,
-        from_line: 2
+        relax_column_count: true
+        // NOTE: removed `from_line: 2` — with columns:true it double-skipped the real
+        // header and used the first product row as column names, making every row's
+        // No./أسم المنتج undefined → all rows skipped → catalog mass-deleted.
       }, (err, data) => err ? reject(err) : resolve(data));
     });
 
@@ -458,6 +521,7 @@ app.post('/products/api/upload', requireAuth, upload.single('csv'), async (req, 
     const seenSet = new Set();
 
     let added = 0, updated = 0, skipped = 0;
+    const changed = []; // حبة 2b — المنتجات التي تغيّرت فعلاً (rowCount>0) لنشرها للـHub
     const cap = v => {
       const n = parseFloat(v);
       if (isNaN(n) || n === null) return null;
@@ -488,7 +552,7 @@ app.post('/products/api/upload', requireAuth, upload.single('csv'), async (req, 
       ).digest('hex');
 
       try {
-        await db.query(`
+        const _upsertRes = await db.query(`
           INSERT INTO master_products (
             salla_id, sku, name, description, category_path, category_main,
             product_type, promo_label, price_regular, price_discounted,
@@ -520,6 +584,23 @@ app.post('/products/api/upload', requireAuth, upload.single('csv'), async (req, 
           hash
         ]);
 
+        // حبة 2b — انشر فقط ما تغيّر فعلاً (INSERT أو UPDATE اجتاز شرط data_hash)
+        if (_upsertRes && _upsertRes.rowCount > 0) {
+          changed.push({
+            salla_id: sallaId,
+            name,
+            sku: safeStr(row['رمز المنتج sku']),
+            price: cap(row['سعر المنتج']) || 0,
+            sale_price: cap(row['السعر المخفض']),
+            availability: safeStr(row['حالة المنتج']),
+            image_url: safeStr(row['صورة المنتج'])?.split(',')[0],
+            description: (safeStr(row['الوصف']) || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000) || null,
+            category,
+            variants,
+            product_url: `https://qaydao.com/-/p${sallaId}`,
+          });
+        }
+
         if (isUpdate) updated++; else added++;
       } catch (err) {
         skipped++;
@@ -527,15 +608,41 @@ app.post('/products/api/upload', requireAuth, upload.single('csv'), async (req, 
       }
     }
 
-    // Soft-delete missing products
+    // حبة 2b — نشر المنتجات المتغيّرة إلى الـHub (fire-and-forget — لا يحجب/يكسر الرفع)
+    if (changed.length) {
+      hubPublish.publishChangedToHub(changed)
+        .catch(e => console.error('[Hub] batch error:', e && e.message));
+    }
+
+    // Soft-delete missing products — WITH SAFETY GUARDS (defense in depth)
     const toRemove = [...existingSet].filter(id => !seenSet.has(id));
     let removed = 0;
-    if (toRemove.length > 0) {
+    let deleteSkippedReason = null;
+    const REMOVE_THRESHOLD = 0.30; // never auto-remove >30% of catalog without explicit confirm
+    const confirmDelete = req.query.confirm_delete === 'true';
+
+    if (seenSet.size === 0) {
+      // Parse produced ZERO valid products → bad file/format. NEVER wipe the catalog.
+      throw new Error('الملف لم يُنتج أي منتج صالح (0 صفوف مُعرّفة). تم إيقاف العملية لحماية الكتالوج — تحقّق من ترويسة الملف وأعمدته (No. / أسم المنتج).');
+    }
+
+    if (toRemove.length > 0 && existingSet.size > 0 &&
+        (toRemove.length / existingSet.size) > REMOVE_THRESHOLD && !confirmDelete) {
+      // Suspiciously large deletion → keep adds/updates but SKIP delete and flag for confirmation.
+      deleteSkippedReason = `طُلب حذف ${toRemove.length} من ${existingSet.size} منتج (> ${Math.round(REMOVE_THRESHOLD*100)}%). تم تخطّي الحذف حمايةً للكتالوج. إن كان الحذف مقصوداً أعد الرفع مع confirm_delete=true.`;
+      console.warn('[Upload] delete guard tripped:', deleteSkippedReason);
+    } else if (toRemove.length > 0) {
       const result = await db.query(`
         UPDATE master_products SET deleted_at = NOW()
         WHERE salla_id = ANY($1) AND deleted_at IS NULL
+        RETURNING salla_id, sku
       `, [toRemove]);
       removed = result.rowCount;
+      // حبة 4b — نشر الحذف إلى الـHub (fire-and-forget) → تعطيل downstream (Studio/Sales)
+      if (result.rows && result.rows.length) {
+        hubPublish.publishDeletedToHub(result.rows)
+          .catch(e => console.error('[Hub] delete batch error:', e && e.message));
+      }
     }
 
     const dur = Date.now() - startTime;
@@ -557,7 +664,8 @@ app.post('/products/api/upload', requireAuth, upload.single('csv'), async (req, 
       added, updated, removed, skipped,
       after: after.n,
       duration_ms: dur,
-      job_id: jobId
+      job_id: jobId,
+      delete_skipped_reason: deleteSkippedReason
     });
   } catch (err) {
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -733,10 +841,22 @@ app.get("/products/api/captain/replies", requireAuth, async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const channel = req.query.channel || null;
     const since_hours = parseInt(req.query.since_hours) || 24;
-    const replies = await captain.listCaptainReplies({ limit, channel, since_hours });
+    const conversation_id = req.query.conversation_id || null;
+    const since_id = req.query.since_id || null;
+    const replies = await captain.listCaptainReplies({ limit, channel, since_hours, conversation_id, since_id });
     res.json({ replies, fetched_at: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// فتح محادثة برقمها مباشرة (قفز بلا بحث يدوي)
+app.get("/products/api/captain/conversation/:id/thread", requireAuth, async (req, res) => {
+  try {
+    const data = await captain.getConversationThread(req.params.id);
+    res.json(data);
+  } catch (err) {
+    res.status(404).json({ error: err.message });
   }
 });
 

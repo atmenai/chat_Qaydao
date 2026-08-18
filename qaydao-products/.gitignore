@@ -20,3 +20,5 @@ uploads/
 *.bak
 *.bak-*
 *.pre-*
+exports/
+*.archived-*

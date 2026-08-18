@@ -23,12 +23,35 @@ function register(app) {
       if (!code) return res.status(400).json({ error: 'code required' });
       const { rows } = await db.query(
         `SELECT l.salla_id, l.sku, l.warehouse_qd_code, l.source,
-                p.name, p.product_url
+                p.name, p.product_url, p.image_url
            FROM product_warehouse_link l
            LEFT JOIN master_products p ON p.salla_id = l.salla_id
           WHERE l.warehouse_qd_code = $1 LIMIT 1`, [code]);
       if (!rows.length) return res.json({ linked: false });
       return res.json({ linked: true, ...rows[0] });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  });
+
+  // Batch: warehouse codes -> images (for warehouse list page)
+  r.get('/images', requireAuthOrService, async (req, res) => {
+    try {
+      const codes = String(req.query.codes || '')
+        .split(',').map(c => c.trim().toUpperCase()).filter(Boolean).slice(0, 300);
+      if (!codes.length) return res.status(400).json({ error: 'codes required' });
+      const { rows } = await db.query(
+        `SELECT l.warehouse_qd_code, l.salla_id, p.name, p.image_url, p.product_url,
+                p.price_regular, p.price_discounted
+           FROM product_warehouse_link l
+           LEFT JOIN master_products p ON p.salla_id = l.salla_id
+          WHERE l.warehouse_qd_code = ANY($1)`, [codes]);
+      const map = {};
+      for (const r2 of rows) map[r2.warehouse_qd_code] = {
+        salla_id: r2.salla_id, name: r2.name,
+        image_url: r2.image_url, product_url: r2.product_url,
+        price_regular: r2.price_regular != null ? Number(r2.price_regular) : null,
+        price_discounted: r2.price_discounted != null ? Number(r2.price_discounted) : null
+      };
+      return res.json({ images: map });
     } catch (e) { return res.status(500).json({ error: e.message }); }
   });
 

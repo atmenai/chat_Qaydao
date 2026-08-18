@@ -34,8 +34,14 @@
         <a href="/products/captain" class="text-gray-500 hover:text-gray-800">← العودة</a>
         <h1 class="text-xl font-bold text-gray-800">🤖 ردود QAYDAO AI</h1>
         <span class="text-xs text-gray-500"><span class="pulse-dot"></span>مباشر — كل <span x-text="refreshSec"></span>ث</span>
+        <span x-show="newCount>0" @click="newCount=0" class="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded cursor-pointer" style="display:none">🆕 <span x-text="newCount"></span> رد جديد</span>
+        <span x-show="focusConv" class="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded" style="display:none">محادثة #<span x-text="focusConv"></span> — <button @click="clearFocus()" class="underline">إلغاء</button></span>
       </div>
       <div class="flex items-center gap-3">
+        <div class="flex items-center gap-1">
+          <input type="number" x-model="convQuery" @keydown.enter="jumpToConversation()" placeholder="رقم المحادثة" class="border rounded px-2 py-1 text-sm w-32 focus:ring-2 focus:ring-blue-300 focus:outline-none">
+          <button @click="jumpToConversation()" class="border rounded px-3 py-1 text-sm hover:bg-gray-100" title="افتح المحادثة مباشرة">🔎 افتح</button>
+        </div>
         <label class="text-xs flex items-center gap-1 cursor-pointer">
           <input type="checkbox" x-model="onlyFlagged" @change="loadAll()"> عرض المشاكل فقط
         </label>
@@ -144,7 +150,10 @@
   <div x-show="thread.open" @click.self="thread.open=false" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" style="display:none">
     <div class="bg-white rounded-lg max-w-3xl w-full max-h-[85vh] overflow-hidden flex flex-col">
       <div class="px-4 py-3 border-b flex items-center justify-between">
-        <h3 class="font-bold">المحادثة #<span x-text="thread.conv_id"></span></h3>
+        <h3 class="font-bold">المحادثة #<span x-text="thread.conv_id"></span>
+          <span class="text-xs font-normal text-gray-500" x-text="(threadMeta.customer_name||'') + (threadMeta.inbox_name ? ' · '+threadMeta.inbox_name : '') + ' · ' + (thread.messages||[]).length + ' رسالة'"></span>
+          <a :href="'https://chat.qaydao.com/app/accounts/1/conversations/'+thread.conv_id" target="_blank" class="text-xs text-blue-600 hover:underline mr-2">افتح في Chatwoot ↗</a>
+        </h3>
         <button @click="thread.open=false" class="text-gray-500 text-xl">×</button>
       </div>
       <div class="overflow-y-auto p-4 space-y-2">
@@ -161,30 +170,90 @@
   <script>
     function repliesApp() {
       return {
-        replies: [], stats: {}, loading: false, refreshSec: 30, timer: null,
+        replies: [], stats: {}, loading: false, refreshSec: 10, timer: null, ticks: 0,
         onlyFlagged: false,
+        convQuery: '', focusConv: null, lastId: null, newCount: 0, threadMeta: {},
         filters: { since_hours: 24, channel: 'all' },
         teach: { open: false, question: '', answer: '', original: '', msgId: null, saving: false },
         thread: { open: false, conv_id: null, messages: [] },
 
         get flaggedCount() { return this.replies.filter(r => r.flag_english || r.flag_broken_md).length; },
 
-        async init() { await this.loadAll(); this.timer = setInterval(() => this.loadAll(true), this.refreshSec*1000); },
+        async init() {
+          await this.loadAll();
+          this.timer = setInterval(() => this.tick(), this.refreshSec*1000);
+          document.addEventListener('visibilitychange', () => { if (!document.hidden) this.tick(); });
+        },
+
+        // دورة لحظية: دلتا فقط (الردود الجديدة) + الإحصاءات كل 3 دورات
+        async tick() {
+          if (document.hidden || this.focusConv || this.loading) return;
+          this.ticks++;
+          await this.loadDelta();
+          if (this.ticks % 3 === 0) await this.loadStats();
+        },
 
         async loadAll(silent = false) {
           if (!silent) this.loading = true;
+          this.focusConv = null; this.newCount = 0;
           try {
             const q = new URLSearchParams({ limit: 100, channel: this.filters.channel, since_hours: this.filters.since_hours });
             const [rRes, sRes] = await Promise.all([
               fetch('/products/api/captain/replies?'+q).then(r=>r.json()),
               fetch('/products/api/captain/replies/stats?since_hours='+this.filters.since_hours).then(r=>r.json())
             ]);
-            let reps = rRes.replies || [];
-            if (this.onlyFlagged) reps = reps.filter(r => r.flag_english || r.flag_broken_md);
-            this.replies = reps;
+            const all = rRes.replies || [];
+            if (all.length) this.lastId = Math.max(...all.map(r => r.captain_msg_id));
+            this.replies = this.onlyFlagged ? all.filter(r => r.flag_english || r.flag_broken_md) : all;
             this.stats = sRes.overall || {};
           } catch(e) { console.error(e); } finally { this.loading = false; }
         },
+
+        async loadStats() {
+          try {
+            const sRes = await fetch('/products/api/captain/replies/stats?since_hours='+this.filters.since_hours).then(r=>r.json());
+            this.stats = sRes.overall || {};
+          } catch(e) { console.error(e); }
+        },
+
+        // تحميل الجديد فقط بدل إعادة تحميل القائمة كاملة
+        async loadDelta() {
+          if (!this.lastId) return this.loadAll(true);
+          try {
+            const q = new URLSearchParams({ limit: 50, channel: this.filters.channel, since_hours: this.filters.since_hours, since_id: this.lastId });
+            const res = await fetch('/products/api/captain/replies?'+q).then(r=>r.json());
+            const all = res.replies || [];
+            if (!all.length) return;
+            this.lastId = Math.max(this.lastId, ...all.map(r => r.captain_msg_id));
+            const known = new Set(this.replies.map(r => r.captain_msg_id));
+            let neu = all.filter(r => !known.has(r.captain_msg_id));
+            if (this.onlyFlagged) neu = neu.filter(r => r.flag_english || r.flag_broken_md);
+            if (neu.length) {
+              this.replies = [...neu, ...this.replies].slice(0, 200);
+              this.newCount += neu.length;
+            }
+          } catch(e) { console.error(e); }
+        },
+
+        // القفز لمحادثة برقمها: تُفتح كاملة فوراً وتُعرض ردود الكابتن داخلها للتصحيح
+        async jumpToConversation() {
+          const id = parseInt(this.convQuery);
+          if (!id) return;
+          this.loading = true;
+          try {
+            const [thr, rep] = await Promise.all([
+              fetch('/products/api/captain/conversation/'+id+'/thread').then(r=>r.json()),
+              fetch('/products/api/captain/replies?'+new URLSearchParams({ limit: 100, channel: 'all', conversation_id: id })).then(r=>r.json())
+            ]);
+            if (thr.error) { alert('لم تُوجد المحادثة #'+id); return; }
+            this.focusConv = id;
+            this.threadMeta = thr;
+            this.replies = rep.replies || [];
+            this.thread = { open: true, conv_id: id, messages: thr.thread || [] };
+          } catch(e) { alert('فشل: '+e.message); } finally { this.loading = false; }
+        },
+
+        clearFocus() { this.convQuery = ''; this.focusConv = null; this.loadAll(); },
 
         openTeach(r) {
           this.teach = {
@@ -212,13 +281,13 @@
           } catch(e) { alert('فشل: '+e.message); } finally { this.teach.saving = false; }
         },
 
+        // مسار واحد لفتح المحادثة — برقمها مباشرة بلا اعتماد على القائمة المحمّلة
         async openThread(convId) {
-          // Find a reply in this conversation to get its detail (thread)
-          const r = this.replies.find(x => x.conversation_id === convId);
-          if (!r) return;
           try {
-            const detail = await fetch('/products/api/captain/replies/'+r.captain_msg_id+'/detail').then(r=>r.json());
-            this.thread = { open: true, conv_id: convId, messages: detail.thread || [] };
+            const thr = await fetch('/products/api/captain/conversation/'+convId+'/thread').then(r=>r.json());
+            if (thr.error) { alert('تعذّر فتح المحادثة #'+convId); return; }
+            this.threadMeta = thr;
+            this.thread = { open: true, conv_id: convId, messages: thr.thread || [] };
           } catch(e) { alert('فشل: '+e.message); }
         },
 

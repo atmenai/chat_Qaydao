@@ -283,12 +283,25 @@ async function getStats() {
 //  LIVE REPLIES — Captain conversation history viewer
 // ────────────────────────────────────────────────────────────
 
-async function listCaptainReplies({ limit = 50, channel = null, since_hours = 24 } = {}) {
-  const params = [ASSISTANT_ID, since_hours, parseInt(limit) || 50];
+async function listCaptainReplies({ limit = 50, channel = null, since_hours = 24, conversation_id = null, since_id = null } = {}) {
+  const convId = parseInt(conversation_id) || null;
+  const sinceId = parseInt(since_id) || null;
+  // البحث برقم محادثة يتجاوز النافذة الزمنية (10 سنوات) لتظهر المحادثات القديمة
+  const params = [ASSISTANT_ID, convId ? 87600 : since_hours, parseInt(limit) || 50];
   let channelFilter = '';
   if (channel && channel !== 'all') {
     channelFilter = 'AND i.channel_type = $' + (params.length + 1);
     params.push(channel);
+  }
+  let convFilter = '';
+  if (convId) {
+    convFilter = 'AND m.conversation_id = $' + (params.length + 1);
+    params.push(convId);
+  }
+  let sinceIdFilter = '';
+  if (sinceId) {
+    sinceIdFilter = 'AND m.id > $' + (params.length + 1);
+    params.push(sinceId);
   }
 
   const sql = `
@@ -303,6 +316,8 @@ async function listCaptainReplies({ limit = 50, channel = null, since_hours = 24
       FROM messages m
       WHERE m.sender_type = 'Captain::Assistant'
         AND m.created_at > NOW() - ($2 || ' hours')::interval
+        ${convFilter}
+        ${sinceIdFilter}
         AND (m.private = false OR m.private IS NULL)
         AND m.content NOT LIKE 'Auto-handoff:%'
         AND m.content NOT LIKE '%إنهاء هذه المحادثة%'
@@ -572,6 +587,43 @@ async function getReplyDetail(msgId) {
   return reply;
 }
 
+// فتح محادثة كاملة برقمها مباشرة — حتى لو لم يكن للكابتن رد داخلها
+async function getConversationThread(conversation_id) {
+  const convId = parseInt(conversation_id) || null;
+  if (!convId) throw new Error('conversation_id required');
+
+  const { rows: metaRows } = await chatwootPool.query(`
+    SELECT c.id AS conversation_id, c.status AS conv_status, c.inbox_id,
+           i.name AS inbox_name, i.channel_type,
+           cont.name AS customer_name, cont.phone_number AS customer_phone,
+           c.created_at AT TIME ZONE 'UTC' AS conv_created_at
+    FROM conversations c
+    JOIN inboxes i ON i.id = c.inbox_id
+    LEFT JOIN contacts cont ON cont.id = c.contact_id
+    WHERE c.id = $1
+  `, [convId]);
+  if (!metaRows[0]) throw new Error('conversation not found');
+
+  const { rows: thread } = await chatwootPool.query(`
+    SELECT m.id, m.content, m.message_type, m.sender_type, m.private,
+           m.created_at AT TIME ZONE 'UTC' AS created_at,
+           CASE m.sender_type
+             WHEN 'Contact' THEN cont.name
+             WHEN 'User' THEN u.name
+             WHEN 'Captain::Assistant' THEN 'QAYDAO AI'
+             ELSE m.sender_type
+           END AS sender_name
+    FROM messages m
+    LEFT JOIN contacts cont ON cont.id = m.sender_id AND m.sender_type = 'Contact'
+    LEFT JOIN users u ON u.id = m.sender_id AND m.sender_type = 'User'
+    WHERE m.conversation_id = $1
+    ORDER BY m.id
+    LIMIT 200
+  `, [convId]);
+
+  return { ...metaRows[0], thread_count: thread.length, thread };
+}
+
 // "Teach": take a customer question + the correct answer, add it as a FAQ
 // so Captain answers correctly next time. Generates embedding synchronously.
 async function teachFromReply({ question, answer, reviewer, source_msg_id }) {
@@ -702,7 +754,7 @@ module.exports = {
   // Replies viewer
   listCaptainReplies, getRepliesStats, getRepliesByChannel,
   // Reply control
-  getReplyDetail, teachFromReply, findRelatedFAQ,
+  getReplyDetail, getConversationThread, teachFromReply, findRelatedFAQ,
   // Maintenance
   getCaptainStatus, pauseCaptain, resumeCaptain,
   // Learning
