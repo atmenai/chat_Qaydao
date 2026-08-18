@@ -2137,6 +2137,7 @@ function inTab(x){
     case "rejected":     return x.status==="rejected" && !isOld(x);
     case "old_done":     return x.status==="done"     &&  isOld(x);
     case "old_rejected": return x.status==="rejected" &&  isOld(x);
+    case "issues":       return !!x.issue_type && x.status!=="done";
     default:             return true;
   }
 }
@@ -2151,7 +2152,7 @@ function updateTabCounts(scope){
   var c={all:scope.length,new:0,will:0,doing:0,done:0,rejected:0,old_done:0,old_rejected:0,issues:0};
   scope.forEach(function(x){
     var o=isOld(x);
-    if(x.issue_type)c.issues++;
+    if(x.issue_type && x.status!=="done")c.issues++;
     if(x.status==="new")c.new++;
     else if(x.status==="will")c.will++;
     else if(x.status==="doing")c.doing++;
