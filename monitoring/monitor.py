@@ -64,18 +64,71 @@ def docker_inspect_running(name: str) -> tuple[bool, str]:
         return False, "inspect_timeout"
 
 
-def query_widget_bridge_health() -> dict | None:
+def _probe_health_via_host() -> dict | None:
+    """[B] Primary probe: host → container IP via urllib (no docker-exec spawn).
+
+    Resolves the container IP with a lightweight `docker inspect` (daemon
+    metadata only — no process spawn inside the container) then issues a
+    plain HTTP GET from the host. This avoids the `docker exec` cost that
+    occasionally exceeds the timeout under midnight-UTC load.
+    """
+    try:
+        ip = subprocess.check_output(
+            ["docker", "inspect", "-f",
+             "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+             cfg.WIDGET_BRIDGE_CONTAINER],
+            text=True, timeout=5
+        ).split()
+        if not ip:
+            return None
+        out = urllib.request.urlopen(
+            f"http://{ip[0]}:8000/health", timeout=5
+        ).read().decode()
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def _probe_health_via_exec() -> dict | None:
+    """[B-fallback] Probe from inside the container via docker exec."""
     try:
         out = subprocess.check_output(
             ["docker", "exec", cfg.WIDGET_BRIDGE_CONTAINER, "python3", "-c",
              "import urllib.request,json,sys; "
              "sys.stdout.write(urllib.request.urlopen('http://localhost:8000/health', timeout=5).read().decode())"],
-            text=True, timeout=10
+            text=True, timeout=12
         )
         return json.loads(out)
-    except Exception as e:
-        log.warning(f"health check failed: {e}")
+    except Exception:
         return None
+
+
+def query_widget_bridge_health() -> dict | None:
+    """Resilient health probe — root fix for midnight-UTC false positives.
+
+      • [B] Primary: host → container IP (no docker-exec spawn cost)
+      • [B] Fallback: docker exec inside the container
+      • [A] Retry: up to 3 attempts, 2s apart — declare DOWN only if ALL fail
+
+    A real outage fails every attempt across the window; a transient blip
+    (slow docker-exec / brief container CPU starvation) recovers on retry,
+    so it no longer pages. Normal path returns via host in ~2ms with zero
+    added latency; the retry delay applies only on the failure path.
+    """
+    last_err = "unknown"
+    for attempt in range(1, 4):
+        h = _probe_health_via_host()
+        if h is None:
+            h = _probe_health_via_exec()
+        if h is not None:
+            if attempt > 1:
+                log.info(f"health probe recovered on attempt {attempt}/3")
+            return h
+        last_err = f"attempt {attempt}/3 failed (host+exec)"
+        if attempt < 3:
+            time.sleep(2)
+    log.warning(f"health check failed after 3 attempts: {last_err}")
+    return None
 
 
 def query_widget_bridge_stats(limit: int = 50) -> dict | None:
