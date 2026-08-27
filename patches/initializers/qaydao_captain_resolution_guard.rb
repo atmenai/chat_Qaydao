@@ -142,14 +142,13 @@ Rails.application.config.to_prepare do
         # 4) stage 2 — decide only after the longer idle window.
         return if conversation.last_activity_at.present? && conversation.last_activity_at > (Time.now.utc - QAYDAO_DECISION_IDLE)
 
-        if qaydao_purchase_intent?(conversation)
-          Rails.logger.info("[qaydao-noautoclose] conv ##{conversation.id} purchase intent -> handoff to team")
-          qaydao_handoff(conversation, inbox, 'purchase intent, no reply to closing check')
-        else
-          Rails.logger.info("[qaydao-noautoclose] conv ##{conversation.id} completed -> resolve")
-          create_resolution_message(conversation, inbox)
-          conversation.resolved!
-        end
+        # 2026-08-27 (Rami: "اعتمد الخيار 1") — ZERO auto-close. Any conversation
+        # that had at least one customer message is handed to the team; only a
+        # human agent may close it. Triggered by conv #4591: an answered order
+        # tracking chat was still auto-resolved, which the CS team rejects.
+        reason = qaydao_purchase_intent?(conversation) ? 'purchase intent' : 'no reply to closing check'
+        Rails.logger.info("[qaydao-noautoclose] conv ##{conversation.id} -> handoff to team (#{reason})")
+        qaydao_handoff(conversation, inbox, "#{reason}; closing decision belongs to CS")
       rescue StandardError => e
         Rails.logger.warn("[qaydao-noautoclose] conv ##{conversation&.id} error -> SKIP (fail-safe): #{e.message}")
         nil
