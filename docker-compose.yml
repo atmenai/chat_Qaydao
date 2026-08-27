@@ -55,6 +55,7 @@ services:
       - ./patches/jobs/qaydao_retry_unassigned_conversations_job.rb:/app/app/jobs/qaydao_retry_unassigned_conversations_job.rb:ro
       - ./patches/initializers/qaydao_cron_jobs.rb:/app/config/initializers/qaydao_cron_jobs.rb:ro
       - ./patches/initializers/qaydao_captain_resolution_guard.rb:/app/config/initializers/qaydao_captain_resolution_guard.rb:ro
+      - ./patches/initializers/qaydao_csat_human_guard.rb:/app/config/initializers/qaydao_csat_human_guard.rb:ro
       - ./patches/initializers/qaydao_discount_code_guard.rb:/app/config/initializers/qaydao_discount_code_guard.rb:ro
       - ./patches/initializers/qaydao_allow_products_api.rb:/app/config/initializers/qaydao_allow_products_api.rb:ro
       - ./patches/initializers/zz_qaydao_rack_attack_login.rb:/app/config/initializers/zz_qaydao_rack_attack_login.rb:ro
@@ -102,6 +103,7 @@ services:
       - ./patches/jobs/qaydao_retry_unassigned_conversations_job.rb:/app/app/jobs/qaydao_retry_unassigned_conversations_job.rb:ro
       - ./patches/initializers/qaydao_cron_jobs.rb:/app/config/initializers/qaydao_cron_jobs.rb:ro
       - ./patches/initializers/qaydao_captain_resolution_guard.rb:/app/config/initializers/qaydao_captain_resolution_guard.rb:ro
+      - ./patches/initializers/qaydao_csat_human_guard.rb:/app/config/initializers/qaydao_csat_human_guard.rb:ro
       - ./patches/initializers/qaydao_discount_code_guard.rb:/app/config/initializers/qaydao_discount_code_guard.rb:ro
       - ./patches/initializers/qaydao_allow_products_api.rb:/app/config/initializers/qaydao_allow_products_api.rb:ro
       - ./patches/initializers/zz_qaydao_rack_attack_login.rb:/app/config/initializers/zz_qaydao_rack_attack_login.rb:ro
@@ -112,6 +114,8 @@ services:
       - ./patches/qaydao_custom_filter_order.rb:/app/config/initializers/qaydao_custom_filter_order.rb:ro
       # QAYDAO patch 2026-07-29: summary report cards use median instead of mean
       - ./patches/builders/v2/reports/timeseries/average_report_builder.rb:/app/app/builders/v2/reports/timeseries/average_report_builder.rb:ro
+      # QAYDAO probe 2026-08-27: round-robin queue diagnostics (read-only, sidekiq only)
+      - ./patches/initializers/qaydao_roundrobin_probe.rb:/app/config/initializers/qaydao_roundrobin_probe.rb:ro
 
   chatwoot-sidekiq-captain:
     image: chatwoot/chatwoot:v4.13.0
@@ -139,6 +143,7 @@ services:
       - ./patches/jobs/qaydao_retry_unassigned_conversations_job.rb:/app/app/jobs/qaydao_retry_unassigned_conversations_job.rb:ro
       - ./patches/initializers/qaydao_cron_jobs.rb:/app/config/initializers/qaydao_cron_jobs.rb:ro
       - ./patches/initializers/qaydao_captain_resolution_guard.rb:/app/config/initializers/qaydao_captain_resolution_guard.rb:ro
+      - ./patches/initializers/qaydao_csat_human_guard.rb:/app/config/initializers/qaydao_csat_human_guard.rb:ro
       - ./patches/initializers/qaydao_discount_code_guard.rb:/app/config/initializers/qaydao_discount_code_guard.rb:ro
       - ./patches/initializers/qaydao_allow_products_api.rb:/app/config/initializers/qaydao_allow_products_api.rb:ro
       - ./patches/initializers/zz_qaydao_rack_attack_login.rb:/app/config/initializers/zz_qaydao_rack_attack_login.rb:ro
