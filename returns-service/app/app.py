@@ -1428,9 +1428,9 @@ function stockRibbon(d){
   var it=d.items[0];
   var extra=d.count>1?('<span class="sc">+'+(d.count-1)+' صنف آخر</span>'):'';
   var loc=it.location?(' · الموقع '+esc(it.location)):'';
-  return '<div class="ribbon-stock">متوفر في مستودع السعودية'+
+  return '<div class="ribbon-stock">متوفر في مستودع السعودية — لا تصرف المبلغ قبل مراجعة العميل'+
          '<span class="sk">'+esc(it.code||"")+' · متاح '+esc(String(it.available))+loc+
-         ' — اعرض الاستبدال أو التسليم الفوري قبل الاسترجاع</span>'+extra+'</div>';
+         ' — تأكّد من العميل ثم اشحن له الصنف من المستودع بدل الاسترجاع</span>'+extra+'</div>';
 }
 function fillStock(slot,d){
   var html=stockRibbon(d);

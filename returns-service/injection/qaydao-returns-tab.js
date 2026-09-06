@@ -298,7 +298,7 @@
     var loc=it.location?(" \u00B7 الموقع "+esc(it.location)):"";
     box.innerHTML='\uD83D\uDCE6 <b>هذا المنتج متوفر في مستودع السعودية</b>'+esc(more)+
       '<span class="qd-sk">'+esc(it.code||"")+' \u00B7 متاح '+esc(String(it.available))+loc+
-      ' \u2014 اعرضي على العميل <b>الاستبدال أو التسليم الفوري</b> قبل إتمام الإرجاع.</span>';
+      ' \u2014 تأكّدي من العميل ثم <b>اشحني له الصنف من المستودع</b> بدل الاسترجاع.</span>';
     box.className="qd-stock show";
   }
   function checkStock(){
