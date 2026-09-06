@@ -932,6 +932,107 @@ async def download_receipt(rid: int):
     )
 
 
+# ---------------------------------------------------------------------------
+# stock-hint 2026-09-06 — تنبيه توفر الصنف في مستودع السعودية
+# ---------------------------------------------------------------------------
+# الغرض: قبل إتمام أي إرجاع، يعرف الموظف/المحاسب/المشتريات أن الصنف موجود
+# فعلياً في مستودع السعودية فيعرض الاستبدال أو التسليم الفوري بدل الاسترجاع.
+#
+# المصدر: CN-Ops عبر /internal/order-stock (محمية بـ Bearer token).
+# الحساب لا يُكرَّر هنا إطلاقاً — CN-Ops يستدعي warehouse_match.stock_for_codes
+# وهي نفسها مصدر الشارة الحمراء في شاشة الطلبات وبوابة اعتماد الشراء.
+#
+# مبادئ التصميم:
+# - السر يبقى على الخادم؛ لا يصل المتصفح إطلاقاً.
+# - مهلة قصيرة (3 ثوانٍ) + كاش دقيقتان — لا يبطئ النموذج أبداً.
+# - أي فشل (شبكة/مهلة/401) = صمت: {"available": false} بلا رمي خطأ،
+#   حتى لا يتعطّل إنشاء طلب الإرجاع بسبب خدمة خارجية.
+# - الطلبات قبل يوليو 2026 غالباً بلا cn_code ⇒ صمت طبيعي لا عطب.
+
+CNOPS_STOCK_URL = os.environ.get(
+    "CNOPS_STOCK_URL", "https://cn.qaydao.com/api/internal/order-stock"
+)
+CNOPS_SERVICE_TOKEN = os.environ.get("CNOPS_SERVICE_TOKEN", "")
+STOCK_HINT_TTL = 120          # ثانية
+STOCK_HINT_TIMEOUT = 3.0      # ثانية
+_stock_cache: dict = {}       # {order_number: (expires_at_epoch, payload)}
+
+
+def _fetch_order_stock_blocking(order_number: str) -> dict:
+    """استدعاء CN-Ops عبر urllib (بلا اعتمادية جديدة). يُشغَّل في thread منفصل."""
+    import urllib.parse
+    import urllib.request
+
+    url = f"{CNOPS_STOCK_URL}?{urllib.parse.urlencode({'order_number': order_number})}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {CNOPS_SERVICE_TOKEN}",
+            "Accept": "application/json",
+            "User-Agent": "qaydao-returns-service/stock-hint",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=STOCK_HINT_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+async def _stock_hint_payload(order_number: str) -> dict:
+    """النتيجة المبسّطة التي تستهلكها الواجهات الثلاث. لا ترمي استثناءً أبداً."""
+    import asyncio
+    import time
+
+    key = (order_number or "").strip()
+    empty = {"available": False, "count": 0, "items": [], "checked": False}
+    if not key or not CNOPS_SERVICE_TOKEN:
+        return empty
+
+    hit = _stock_cache.get(key)
+    now = time.time()
+    if hit and hit[0] > now:
+        return hit[1]
+
+    try:
+        raw = await asyncio.to_thread(_fetch_order_stock_blocking, key)
+    except Exception as exc:  # noqa: BLE001 — الصمت مقصود
+        print(f"[stock-hint] lookup failed for {key}: {type(exc).__name__}: {exc}", flush=True)
+        return empty
+
+    items = [
+        {
+            "code": it.get("cn_code"),
+            "name": it.get("warehouse_item_name") or it.get("name"),
+            "size": it.get("size"),
+            "color": it.get("color"),
+            "available": it.get("available"),
+            "location": it.get("location"),
+        }
+        for it in (raw.get("items") or [])
+        if it.get("matched") and (it.get("available") or 0) > 0
+    ]
+    payload = {
+        "available": bool(items),
+        "count": len(items),
+        "items": items,
+        "checked": True,
+        "found": bool(raw.get("found")),
+    }
+    # التنظيف عند تضخّم الكاش — خدمة صغيرة، لا حاجة لمكتبة كاش.
+    if len(_stock_cache) > 500:
+        _stock_cache.clear()
+    _stock_cache[key] = (now + STOCK_HINT_TTL, payload)
+    return payload
+
+
+@app.get("/returns/api/stock-hint")
+async def stock_hint(order_number: str = ""):
+    """
+    توفر بنود الطلب في مستودع السعودية.
+    يستهلكها: نموذج خدمة العملاء داخل Chatwoot، بطاقة المحاسب/المشتريات،
+    وصفحة فريق خدمة العملاء.
+    """
+    return await _stock_hint_payload(order_number)
+
+
 @app.get("/returns/api/config")
 async def config():
     return {"reasons": REASONS, "assignees": ASSIGNEES, "status_labels": STATUS_LABELS}
@@ -1091,6 +1192,10 @@ header p{font-size:13px;color:var(--soft);margin-top:2px}
 .card.is-new{position:relative}
 .ribbon-new{display:flex;align-items:center;gap:6px;background:linear-gradient(90deg,var(--ok),#2f9e6f);color:#fff;font-weight:800;font-size:12px;letter-spacing:.2px;padding:7px 14px}
 .ribbon-new::before{content:"\1F195"}
+.ribbon-stock{display:flex;align-items:center;gap:8px;background:linear-gradient(90deg,#b9770e,#e59f1a);color:#fff;font-weight:800;font-size:12px;letter-spacing:.2px;padding:8px 14px;line-height:1.6}
+.ribbon-stock::before{content:"\1F4E6";font-size:15px}
+.ribbon-stock .sk{font-weight:600;opacity:.95;font-size:11.5px}
+.ribbon-stock .sc{background:rgba(255,255,255,.22);border-radius:6px;padding:1px 7px;font-size:11.5px}
 .sbtn:hover{transform:translateY(-1px)}
 .sbtn.active{box-shadow:0 0 0 3px rgba(31,95,91,.14)}
 .qd-note-in{width:100%;font-family:inherit;font-size:12.5px;color:#1f2b3a;background:#f8fafb;border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin-top:10px;resize:vertical}
@@ -1307,6 +1412,41 @@ function render(){
   if(!list.length){g.innerHTML="";e.style.display="block";return}
   e.style.display="none";
   g.innerHTML=list.map(card).join("");
+  loadStockHints();
+}
+// ---------------------------------------------------------------------------
+// stock-hint 2026-09-06 — تنبيه توفر الصنف في مستودع السعودية
+// قبل صرف أي مبلغ: إن كان الصنف موجوداً فعلياً في مستودع جدة، يُعرض الاستبدال
+// أو التسليم الفوري بدل الاسترجاع. يراه المحاسب والنذير على نفس البطاقة.
+// - غير معطِّل: يُحمَّل بعد رسم البطاقات، وأي فشل = لا شيء يظهر (صمت).
+// - كاش داخل الصفحة حتى لا يتكرر الطلب لنفس رقم الطلب عند كل فلترة.
+// - الطلبات قبل يوليو 2026 غالباً بلا كود صنف ⇒ صمت طبيعي لا عطب.
+// ---------------------------------------------------------------------------
+var STOCK_CACHE={};
+function stockRibbon(d){
+  if(!d||!d.available||!d.items||!d.items.length)return "";
+  var it=d.items[0];
+  var extra=d.count>1?('<span class="sc">+'+(d.count-1)+' صنف آخر</span>'):'';
+  var loc=it.location?(' · الموقع '+esc(it.location)):'';
+  return '<div class="ribbon-stock">متوفر في مستودع السعودية'+
+         '<span class="sk">'+esc(it.code||"")+' · متاح '+esc(String(it.available))+loc+
+         ' — اعرض الاستبدال أو التسليم الفوري قبل الاسترجاع</span>'+extra+'</div>';
+}
+function fillStock(slot,d){
+  var html=stockRibbon(d);
+  if(html)slot.outerHTML=html; else slot.remove();
+}
+function loadStockHints(){
+  var slots=[].slice.call(document.querySelectorAll(".stkslot"));
+  slots.forEach(function(slot){
+    var on=slot.getAttribute("data-order")||"";
+    if(!on){slot.remove();return}
+    if(STOCK_CACHE[on]!==undefined){fillStock(slot,STOCK_CACHE[on]);return}
+    fetch("/returns/api/stock-hint?order_number="+encodeURIComponent(on),{credentials:"same-origin"})
+      .then(function(r){return r.ok?r.json():null})
+      .then(function(d){STOCK_CACHE[on]=d;fillStock(slot,d)})
+      .catch(function(){slot.remove()});
+  });
 }
 // طلب حديث = تاريخ طلب المنتجات الأصلي خلال 3 أيام أو أقل من اليوم (مقارنة تواريخ فقط)
 function isRecentOrder(d){
@@ -1369,6 +1509,7 @@ function card(x){
   return '<div class="card'+(isNew?' is-new':'')+(x.issue_type?' has-issue':'')+'">'+
     issueBanner+
     (isNew?'<div class="ribbon-new">طلب منتج جديد</div>':'')+
+    (x.status==="done"?'':'<div class="stkslot" data-order="'+esc(x.order_number||'')+'"></div>')+
     '<div class="chead"><span class="nm">'+esc(x.customer_name||"—")+'</span><span class="st '+x.status+'">'+esc(SL[x.status]||x.status)+'</span></div>'+
     '<div class="cbody">'+
       '<div class="rowf"><span class="k">اسم العميل</span><span class="v">'+esc(x.customer_name||"—")+'</span></div>'+
@@ -1998,6 +2139,9 @@ tr.rejrow{background:var(--rejsoft)}
 .b-rejected{background:var(--rejsoft);color:var(--rej)}
 .b-done_salla{background:#eef4ff;color:#3b5bdb}
 .b-rejected_contacted{background:#eef1f4;color:#5a6b7d;border:1px solid #d7dde4}
+/* stock-hint 2026-09-06 — شارة توفر الصنف في مستودع السعودية */
+.stkb{display:inline-block;margin-top:4px;background:linear-gradient(90deg,#b9770e,#e59f1a);color:#fff;border-radius:6px;padding:2px 7px;font-size:10.5px;font-weight:800;line-height:1.7;direction:rtl;white-space:nowrap}
+.stkb .l{font-weight:600;opacity:.95}
 tr.contactedrow{background:#fbfcfd}
 tr.issuerow{background:#fdf0ef;box-shadow:inset 3px 0 0 0 #b3261e}
 tr.issuerow td{border-color:#f3c6c1}
@@ -2278,6 +2422,33 @@ function render(){
   if(!list.length){tb.innerHTML="";e.style.display="block";return}
   e.style.display="none";
   tb.innerHTML=list.map(row).join("");
+  loadStockHintsT();
+}
+// ---------------------------------------------------------------------------
+// stock-hint 2026-09-06 — شارة توفر الصنف في مستودع السعودية (صفحة الفريق)
+// متابعة بصرية فقط: أي مرتجع لم يُصرف مبلغه بعد وصنفه موجود في مستودع جدة
+// يظهر بشارة كهرمانية بجوار رقم الطلب. لا تغيّر حالة ولا صلاحية.
+// - يُحمَّل بعد رسم الجدول ⇒ لا يبطئ العرض. أي فشل = لا شيء يظهر.
+// ---------------------------------------------------------------------------
+var STOCK_CACHE_T={};
+function stockBadgeT(d){
+  if(!d||!d.available||!d.items||!d.items.length)return "";
+  var it=d.items[0];
+  var more=d.count>1?(" +"+(d.count-1)):"";
+  return '<span class="stkb">\uD83D\uDCE6 بالمستودع'+esc(more)+
+         ' <span class="l">'+esc(it.code||"")+' \u00B7 '+esc(String(it.available))+'</span></span>';
+}
+function loadStockHintsT(){
+  [].slice.call(document.querySelectorAll(".stkslotT")).forEach(function(slot){
+    var on=slot.getAttribute("data-order")||"";
+    if(!on){slot.remove();return}
+    function fill(d){var h=stockBadgeT(d);if(h)slot.outerHTML=h;else slot.remove()}
+    if(STOCK_CACHE_T[on]!==undefined){fill(STOCK_CACHE_T[on]);return}
+    fetch("/returns/api/stock-hint?order_number="+encodeURIComponent(on),{credentials:"same-origin"})
+      .then(function(r){return r.ok?r.json():null})
+      .then(function(d){STOCK_CACHE_T[on]=d;fill(d)})
+      .catch(function(){slot.remove()});
+  });
 }
 function row(x){
   var rej=x.status==="rejected";
@@ -2308,7 +2479,10 @@ function row(x){
   return '<tr class="'+rowCls+'">'+
     '<td class="ltr">'+esc(x.conversation_id||"—")+'</td>'+
     '<td>'+esc(x.customer_name||"—")+'</td>'+
-    '<td class="ltr">'+esc(x.order_number||"—")+'</td>'+
+    '<td class="ltr">'+esc(x.order_number||"—")+
+      // rami 2026-09-06: الطلب المنتهي مالياً (done) أُرجع مبلغه فعلاً ⇒ لا شارة
+      ((x.status!=="done" && x.order_number)
+        ? '<div class="stkslotT" data-order="'+esc(x.order_number)+'"></div>' : '')+'</td>'+
     '<td>'+esc(x.reason||"—")+'</td>'+
     '<td>'+esc(x.refund_method_label||"—")+'</td>'+
     '<td>'+badge+'</td>'+

@@ -51,7 +51,10 @@ else
 fi
 
 # --- 3. sanity check: the dump must actually contain the table ---
-if ! zcat "$DEST/returns_db.sql.gz" | grep -q "return_requests"; then
+# 2026-09-06: كان `zcat | grep -q` يقتل zcat بـSIGPIPE ومع pipefail يُحسب فشلاً
+# كاذباً رغم سلامة النسخة. zgrep -c يقرأ الملف كاملاً فلا SIGPIPE.
+HITS="$(zgrep -c "return_requests" "$DEST/returns_db.sql.gz" || true)"
+if [ "${HITS:-0}" -lt 1 ]; then
     fail "dump looks invalid (return_requests not found)"
 fi
 ROWS=$(docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -t -A \

@@ -24,6 +24,9 @@ services:
       - ./.env
     environment:
       UPLOAD_DIR: /data/uploads
+      # 2026-09-06 stock-hint bridge إلى CN-Ops
+      CNOPS_STOCK_URL: ${CNOPS_STOCK_URL:-https://cn.qaydao.com/api/internal/order-stock}
+      CNOPS_SERVICE_TOKEN: ${CNOPS_SERVICE_TOKEN:-}
     volumes:
       - returns-uploads:/data/uploads
     depends_on:

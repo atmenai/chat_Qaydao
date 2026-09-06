@@ -216,7 +216,12 @@
     ".qd-cancel{background:#eef1f4;color:#5a6b7d;border:none;border-radius:10px;padding:11px 18px;font-family:inherit;font-weight:600;font-size:14px;cursor:pointer}"+
     ".qd-msg{font-size:13px;font-weight:600;margin-inline-start:auto}"+
     ".qd-msg.ok{color:#1f7a4d}.qd-msg.err{color:#c0392b}"+
-    ".qd-note{background:#fff7e6;border:1px solid #f0d79b;color:#8a6417;border-radius:9px;padding:9px 12px;font-size:12px;margin-bottom:14px}";
+    ".qd-note{background:#fff7e6;border:1px solid #f0d79b;color:#8a6417;border-radius:9px;padding:9px 12px;font-size:12px;margin-bottom:14px}"+
+    /* stock-hint 2026-09-06 — تنبيه توفر الصنف في مستودع السعودية */
+    ".qd-stock{display:none;background:linear-gradient(90deg,#b9770e,#e59f1a);color:#fff;border-radius:10px;padding:11px 13px;font-size:12.5px;line-height:1.75;margin:-4px 0 14px;font-weight:700}"+
+    ".qd-stock.show{display:block}"+
+    ".qd-stock b{font-weight:800}"+
+    ".qd-stock .qd-sk{display:block;font-weight:600;opacity:.96;font-size:12px;margin-top:3px}";
     document.head.appendChild(s);
   }
 
@@ -237,6 +242,7 @@
         '<div class="qd-f"><label>اسم العميل <span class="req">*</span> <span style="color:#c0392b;font-weight:600;font-size:11.5px">— يجب كتابة الاسم الثلاثي</span></label><input id="q_name" placeholder="الاسم الأول واسم الأب واسم العائلة"></div>'+
         '<div class="qd-2"><div class="qd-f"><label>رقم طلب العميل <span class="req">*</span></label><input id="q_order" dir="ltr" style="text-align:right"></div>'+
           '<div class="qd-f"><label>مبلغ الطلب <span class="req">*</span></label><input id="q_amount" placeholder="1,250 ر.س"></div></div>'+
+        '<div class="qd-stock" id="q_stock"></div>'+
         '<div class="qd-2"><div class="qd-f"><label>تاريخ إنشاء طلب الإرجاع <span class="req">*</span></label><input id="q_rdate" type="date"></div>'+
           '<div class="qd-f"><label>تاريخ طلب المنتجات الأصلي <span class="req">*</span></label><input id="q_odate" type="date"></div></div>'+
         '<div class="qd-f"><label>سبب الإرجاع <span class="req">*</span></label><select id="q_reason">'+opts(REASONS)+'</select></div>'+
@@ -270,7 +276,41 @@
     if(rs)rs.addEventListener("change",toggleOtherReason);
     var rf=document.getElementById("q_refund");
     if(rf)rf.addEventListener("change",toggleRefund);
+    var qo=document.getElementById("q_order");
+    if(qo){qo.addEventListener("blur",checkStock);qo.addEventListener("change",checkStock)}
     return ov;
+  }
+  // -------------------------------------------------------------------------
+  // stock-hint 2026-09-06 — تنبيه توفر الصنف في مستودع السعودية
+  // الغرض: قبل فتح طلب الإرجاع أصلاً، تعرف الموظفة أن الصنف موجود فعلياً في
+  // مستودع جدة فتعرض على العميل الاستبدال أو التسليم الفوري بدل الاسترجاع.
+  // - يُستدعى عند مغادرة حقل رقم الطلب — لا يعطّل الحفظ ولا يمنعه إطلاقاً.
+  // - أي فشل (شبكة/مهلة) = لا شيء يظهر. صمت لا خطأ.
+  // - الطلبات قبل يوليو 2026 غالباً بلا كود صنف ⇒ صمت طبيعي.
+  // -------------------------------------------------------------------------
+  var QD_STOCK_CACHE={};
+  function renderStock(d){
+    var box=document.getElementById("q_stock");
+    if(!box)return;
+    if(!d||!d.available||!d.items||!d.items.length){box.className="qd-stock";box.innerHTML="";return}
+    var it=d.items[0];
+    var more=d.count>1?(" \u002B"+(d.count-1)+" صنف آخر"):"";
+    var loc=it.location?(" \u00B7 الموقع "+esc(it.location)):"";
+    box.innerHTML='\uD83D\uDCE6 <b>هذا المنتج متوفر في مستودع السعودية</b>'+esc(more)+
+      '<span class="qd-sk">'+esc(it.code||"")+' \u00B7 متاح '+esc(String(it.available))+loc+
+      ' \u2014 اعرضي على العميل <b>الاستبدال أو التسليم الفوري</b> قبل إتمام الإرجاع.</span>';
+    box.className="qd-stock show";
+  }
+  function checkStock(){
+    var el=document.getElementById("q_order");
+    if(!el)return;
+    var on=(el.value||"").trim();
+    if(!on){renderStock(null);return}
+    if(QD_STOCK_CACHE[on]!==undefined){renderStock(QD_STOCK_CACHE[on]);return}
+    fetch("/returns/api/stock-hint?order_number="+encodeURIComponent(on),{credentials:"same-origin"})
+      .then(function(r){return r.ok?r.json():null})
+      .then(function(d){QD_STOCK_CACHE[on]=d;renderStock(d)})
+      .catch(function(){renderStock(null)});
   }
   function toggleOtherReason(){
     var rs=document.getElementById("q_reason"),wrap=document.getElementById("q_reason_other_wrap");
@@ -330,6 +370,7 @@
     var fe=document.getElementById("q_file");if(fe){fe.value="";fe.classList.remove("qd-invalid")}
     var cur=document.getElementById("q_file_cur");if(cur)cur.innerHTML="";
     var msg=document.getElementById("qd-msg");if(msg){msg.textContent="";msg.className="qd-msg"}
+    var stk=document.getElementById("q_stock");if(stk){stk.innerHTML="";stk.className="qd-stock"}
     window.__qd_current_rid=null;
   }
   function closePanel(){var ov=document.getElementById("qd-ret-ov");if(ov)ov.classList.remove("show")}
